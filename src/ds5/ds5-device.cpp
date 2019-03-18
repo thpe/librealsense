@@ -22,6 +22,13 @@
 #include "ds5-color.h"
 #include "ds5-rolling-shutter.h"
 
+#include "proc/decimation-filter.h"
+#include "proc/threshold.h"
+#include "proc/disparity-transform.h"
+#include "proc/spatial-filter.h"
+#include "proc/temporal-filter.h"
+#include "proc/hole-filling-filter.h"
+
 namespace librealsense
 {
     ds5_auto_exposure_roi_method::ds5_auto_exposure_roi_method(
@@ -77,15 +84,20 @@ namespace librealsense
         explicit ds5_depth_sensor(ds5_device* owner,
             std::shared_ptr<platform::uvc_device> uvc_device,
             std::unique_ptr<frame_timestamp_reader> timestamp_reader)
-            : uvc_sensor(ds::DEPTH_STEREO, uvc_device, move(timestamp_reader), owner), _owner(owner), _depth_units(0)
+            : uvc_sensor(ds::DEPTH_STEREO, uvc_device, move(timestamp_reader), owner), _owner(owner), _depth_units(-1)
         {}
+
+        processing_blocks get_recommended_processing_blocks() const override
+        {
+            return get_ds5_depth_recommended_proccesing_blocks();
+        };
 
         rs2_intrinsics get_intrinsics(const stream_profile& profile) const override
         {
             return get_intrinsic_by_resolution(
                 *_owner->_coefficients_table_raw,
                 ds::calibration_table_id::coefficients_table_id,
-                profile.width, profile.height, profile.fps);
+                profile.width, profile.height);
         }
 
         void open(const stream_profiles& requests) override
@@ -166,7 +178,7 @@ namespace librealsense
             return results;
         }
 
-        float get_depth_scale() const override { return _depth_units; }
+        float get_depth_scale() const override { if (_depth_units < 0) _depth_units = get_option(RS2_OPTION_DEPTH_UNITS).query(); return _depth_units; }
 
         void set_depth_scale(float val){ _depth_units = val; }
 
@@ -193,7 +205,7 @@ namespace librealsense
         }
     protected:
         const ds5_device* _owner;
-        std::atomic<float> _depth_units;
+        mutable std::atomic<float> _depth_units;
         float _stereo_baseline_mm;
     };
 
@@ -292,6 +304,10 @@ namespace librealsense
             val |= d400_caps::CAP_IMU_SENSOR;
         if (0xFF != (gvd_buf[fisheye_sensor_lb] & gvd_buf[fisheye_sensor_hb]))
             val |= d400_caps::CAP_FISHEYE_SENSOR;
+        if (0x1 == gvd_buf[depth_sensor_type])
+            val |= d400_caps::CAP_ROLLING_SHUTTER;  // Standard depth
+        if (0x2 == gvd_buf[depth_sensor_type])
+            val |= d400_caps::CAP_GLOBAL_SHUTTER;   // Wide depth
 
         return val;
     }
@@ -402,7 +418,7 @@ namespace librealsense
             depth_ep.register_pixel_format(pf_y12i); // L+R - Calibration not rectified
         }
 
-        auto pid_hex_str = hexify(pid >> 8) + hexify(static_cast<uint8_t>(pid));
+        auto pid_hex_str = hexify(pid);
 
         std::string is_camera_locked{ "" };
         if (_fw_version >= firmware_version("5.6.3.0"))
@@ -464,7 +480,13 @@ namespace librealsense
                     RS2_OPTION_ASIC_TEMPERATURE));
         }
 
-        if (_fw_version >= firmware_version("5.10.9.0") &&
+        // Alternating laser pattern is applicable for global shutter/active SKUs
+        auto mask = d400_caps::CAP_GLOBAL_SHUTTER | d400_caps::CAP_ACTIVE_PROJECTOR;
+        if ((_fw_version >= firmware_version("5.11.3.0")) && ((_device_capabilities & mask) == mask))
+        {
+            depth_ep.register_option(RS2_OPTION_EMITTER_ON_OFF, std::make_shared<alternating_emitter_option>(*_hw_monitor, &depth_ep));
+        }
+        else if (_fw_version >= firmware_version("5.10.9.0") &&
             _fw_version.experimental()) // Not yet available in production firmware
         {
             depth_ep.register_option(RS2_OPTION_EMITTER_ON_OFF, std::make_shared<emitter_on_and_off_option>(*_hw_monitor, &depth_ep));
@@ -688,6 +710,18 @@ namespace librealsense
                 std::make_shared<asic_and_projector_temperature_options>(depth_ep,
                     RS2_OPTION_PROJECTOR_TEMPERATURE));
         }
+    }
+
+    processing_blocks get_ds5_depth_recommended_proccesing_blocks()
+    {
+        auto res = get_depth_recommended_proccesing_blocks();
+        res.push_back(std::make_shared<threshold>());
+        res.push_back(std::make_shared<disparity_transform>(true));
+        res.push_back(std::make_shared<spatial_filter>());
+        res.push_back(std::make_shared<temporal_filter>());
+        res.push_back(std::make_shared<hole_filling_filter>());
+        res.push_back(std::make_shared<disparity_transform>(false));
+        return res;
     }
 
 }

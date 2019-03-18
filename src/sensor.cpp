@@ -11,11 +11,14 @@
 #include "device.h"
 #include "stream.h"
 #include "sensor.h"
+#include "proc/decimation-filter.h"
 
 namespace librealsense
 {
-    sensor_base::sensor_base(std::string name, device* dev)
-        : _is_streaming(false),
+    sensor_base::sensor_base(std::string name, device* dev, 
+        recommended_proccesing_blocks_interface* owner)
+        : recommended_proccesing_blocks_base(owner),
+        _is_streaming(false),
           _is_opened(false),
           _notifications_processor(std::shared_ptr<notifications_processor>(new notifications_processor())),
           _on_before_frame_callback(nullptr),
@@ -274,6 +277,31 @@ namespace librealsense
         return results;
     }
 
+    processing_blocks get_color_recommended_proccesing_blocks()
+    {
+        processing_blocks res;
+        auto dec = std::make_shared<decimation_filter>();
+        if (!dec->supports_option(RS2_OPTION_STREAM_FILTER))
+            return res;
+        dec->get_option(RS2_OPTION_STREAM_FILTER).set(RS2_STREAM_COLOR);
+        dec->get_option(RS2_OPTION_STREAM_FORMAT_FILTER).set(RS2_FORMAT_ANY);
+        res.push_back(dec);
+        return res;
+    }
+
+    processing_blocks get_depth_recommended_proccesing_blocks()
+    {
+        processing_blocks res;
+        auto dec = std::make_shared<decimation_filter>();
+        if (dec->supports_option(RS2_OPTION_STREAM_FILTER))
+        {
+            dec->get_option(RS2_OPTION_STREAM_FILTER).set(RS2_STREAM_DEPTH);
+            dec->get_option(RS2_OPTION_STREAM_FORMAT_FILTER).set(RS2_FORMAT_Z16);
+            res.push_back(dec);
+        }
+        return res;
+    }
+
     stream_profiles uvc_sensor::init_stream_profiles()
     {
         std::unordered_set<std::shared_ptr<video_stream_profile>> results;
@@ -443,11 +471,14 @@ namespace librealsense
                     auto&& unpacker = *mode.unpacker;
                     for (auto&& output : unpacker.outputs)
                     {
-                        LOG_DEBUG("FrameAccepted," << librealsense::get_string(output.stream_desc.type) << "," << std::dec << frame_counter
-                            << "," << output.stream_desc.index << "," << frame_counter
-                            << ",Arrived," << std::fixed << f.backend_time << " " << std::fixed << system_time<<" diff - "<< system_time- f.backend_time << " "
+                        LOG_DEBUG("FrameAccepted," << librealsense::get_string(output.stream_desc.type)
+                            << ",Counter," << std::dec << frame_counter
+                            << ",Index," << output.stream_desc.index
+                            << ",BackEndTS," << std::fixed << f.backend_time
+                            << ",SystemTime," << std::fixed << system_time
+                            <<" ,diff_ts[Sys-BE],"<< system_time- f.backend_time
                             << ",TS," << std::fixed << timestamp << ",TS_Domain," << rs2_timestamp_domain_to_string(timestamp_domain)
-                            <<" last_frame_number "<< last_frame_number<<" last_timestamp "<< last_timestamp);
+                            <<",last_frame_number,"<< last_frame_number<<",last_timestamp,"<< last_timestamp);
 
                         std::shared_ptr<stream_profile_interface> request = nullptr;
                         for (auto&& original_prof : mode.original_requests)
@@ -737,7 +768,7 @@ namespace librealsense
         std::map<rs2_stream, std::map<unsigned, unsigned>> fps_and_sampling_frequency_per_rs2_stream,
         std::vector<std::pair<std::string, stream_profile>> sensor_name_and_hid_profiles,
         device* dev)
-    : sensor_base("Motion Module", dev), _sensor_name_and_hid_profiles(sensor_name_and_hid_profiles),
+    : sensor_base("Motion Module", dev, (recommended_proccesing_blocks_interface*)this), _sensor_name_and_hid_profiles(sensor_name_and_hid_profiles),
       _fps_and_sampling_frequency_per_rs2_stream(fps_and_sampling_frequency_per_rs2_stream),
       _hid_device(hid_device),
       _is_configured_stream(RS2_STREAM_COUNT),
@@ -883,8 +914,10 @@ namespace librealsense
 
         _source.init(_metadata_parsers);
         _source.set_sensor(this->shared_from_this());
+        unsigned long long last_frame_number = 0;
+        rs2_time_t last_timestamp = 0;
         raise_on_before_streaming_changes(true); //Required to be just before actual start allow recording to work
-        _hid_device->start_capture([this](const platform::sensor_data& sensor_data)
+        _hid_device->start_capture([this,last_frame_number,last_timestamp](const platform::sensor_data& sensor_data) mutable
         {
             auto system_time = environment::get_instance().get_time_service()->get_time();
             auto timestamp_reader = _hid_iio_timestamp_reader.get();
@@ -928,18 +961,24 @@ namespace librealsense
             // Determine the timestamp for this HID frame
             auto timestamp = timestamp_reader->get_frame_timestamp(mode, sensor_data.fo);
             auto frame_counter = timestamp_reader->get_frame_counter(mode, sensor_data.fo);
+            auto ts_domain = timestamp_reader->get_frame_timestamp_domain(mode, sensor_data.fo);
 
             frame_additional_data additional_data{};
 
             additional_data.timestamp = timestamp;
             additional_data.frame_number = frame_counter;
-            additional_data.timestamp_domain = timestamp_reader->get_frame_timestamp_domain(mode, sensor_data.fo);
+            additional_data.timestamp_domain = ts_domain;
             additional_data.system_time = system_time;
-            LOG_DEBUG("FrameAccepted," << get_string(request->get_stream_type()) << "," << std::dec << frame_counter
-                      << ",Arrived," << std::fixed << system_time
-                      << ",TS," << std::fixed << timestamp
-                      << ",TS_Domain," << rs2_timestamp_domain_to_string(additional_data.timestamp_domain));
+            LOG_DEBUG("FrameAccepted," << get_string(request->get_stream_type())
+                    << ",Counter," << std::dec << frame_counter << ",Index,0"
+                    << ",BackEndTS," << std::fixed << sensor_data.fo.backend_time
+                    << ",SystemTime," << std::fixed << system_time
+                    <<" ,diff_ts[Sys-BE],"<< system_time- sensor_data.fo.backend_time
+                    << ",TS," << std::fixed << timestamp << ",TS_Domain," << rs2_timestamp_domain_to_string(ts_domain)
+                    <<",last_frame_number,"<< last_frame_number<<",last_timestamp,"<< last_timestamp);
 
+            last_frame_number = frame_counter;
+            last_timestamp = timestamp;
             auto frame = _source.alloc_frame(RS2_EXTENSION_MOTION_FRAME, data_size, additional_data, true);
             if (!frame)
             {
@@ -1037,7 +1076,7 @@ namespace librealsense
     }
 
     uvc_sensor::uvc_sensor(std::string name, std::shared_ptr<platform::uvc_device> uvc_device, std::unique_ptr<frame_timestamp_reader> timestamp_reader, device* dev)
-        : sensor_base(name, dev),
+       :   sensor_base(name, dev, (recommended_proccesing_blocks_interface*)this),
           _device(move(uvc_device)),
           _user_count(0),
           _timestamp_reader(std::move(timestamp_reader))

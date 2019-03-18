@@ -1,3 +1,5 @@
+# License: Apache 2.0. See LICENSE file in root directory.
+# Copyright(c) 2019 Intel Corporation. All Rights Reserved.
 #  minimum required cmake version: 3.1.0
 cmake_minimum_required(VERSION 3.1.0)
 
@@ -41,6 +43,8 @@ endif()
             ./depth-quality-model.h
             ./depth-quality-model.cpp
             ./depth-metrics.h
+            ${LZ4_DIR}/lz4.h
+            ${LZ4_DIR}/lz4.c
             ../../common/rendering.h
             ../../common/ux-window.h
             ../../common/ux-window.cpp
@@ -53,7 +57,16 @@ endif()
             ../../third-party/imgui/imgui-fonts-fontawesome.hpp
             ../../common/ux-alignment.cpp
             ../../common/ux-alignment.h
+            ../../third-party/glad/glad.c
+            ../../common/opengl3.cpp
+            ../../common/opengl3.h
+            ../../common/rs-config.h
+            ../../common/rs-config.cpp
+            ../../common/os.h
+            ../../common/os.cpp
         )
+
+     include_directories(${LZ4_DIR})
 
     if(WIN32)
         add_executable(rs-depth-quality WIN32 ${RS_QUALITY_TOOL_CPP}
@@ -85,6 +98,7 @@ endif()
 
         include_directories(rs-depth-quality ../../common  ../../third-party
                                              ../../third-party/imgui
+                                             ../../third-party/glad
                                              ../../third-party/tclap/include
                                              ${CMAKE_CURRENT_SOURCE_DIR}/res/)
 
@@ -93,6 +107,7 @@ endif()
 
         include_directories(rs-depth-quality ../../common  ../../third-party
                                              ../../third-party/imgui
+                                             ../../third-party/glad
                                              ../../third-party/tclap/include)
     endif()
 

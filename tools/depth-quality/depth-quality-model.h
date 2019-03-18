@@ -1,3 +1,5 @@
+/* License: Apache 2.0. See LICENSE file in root directory. */
+/* Copyright(c) 2019 Intel Corporation. All Rights Reserved. */
 #pragma once
 
 #include <librealsense2/rs.hpp>
@@ -5,6 +7,7 @@
 #include "depth-metrics.h"
 #include "model-views.h"
 #include "ux-window.h"
+#include "os.h"
 
 #include <tuple>
 #include <vector>

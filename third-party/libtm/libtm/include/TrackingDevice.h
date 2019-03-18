@@ -470,6 +470,15 @@ namespace perc
         virtual Status EepromWrite(IN uint16_t offset, IN uint16_t size, IN uint8_t* buffer, OUT uint16_t& actual, IN bool verify = false) = 0;
 
         /**
+        * @brief SetLowPowerMode
+        *        Enable or disable low power mode in idle state in TM2 device.
+        * @param enable - true to enable low power mode, false to disable
+        *
+        * @return Status
+        */
+        virtual Status SetLowPowerMode(bool enable) = 0;
+
+        /**
         * @brief Reset
         *        Resets the device and loads FW
         *        Caution - this function is non blocking, need to sleep at least 2 seconds afterwards to let the FW load again
@@ -479,13 +488,13 @@ namespace perc
         virtual Status Reset(void) = 0;
 
         /**
-        * @brief AppendCalibration
-        *        Append calibration to current SLAM calibration
+        * @brief SetCalibration
+        *        Set new or Append calibration to current SLAM calibration
         * @param calibrationData - Calibration data
         *
         * @return Status
         */
-        virtual Status AppendCalibration(const TrackingData::CalibrationData& calibrationData) = 0;
+        virtual Status SetCalibration(const TrackingData::CalibrationData& calibrationData) = 0;
 
         /**
         * @brief SendFrame

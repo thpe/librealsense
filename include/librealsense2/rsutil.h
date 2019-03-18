@@ -86,7 +86,7 @@ static void rs2_fov(const struct rs2_intrinsics * intrin, float to_fov[2])
 static void next_pixel_in_line(float curr[2], const float start[2], const float end[2])
 {
     float line_slope = (end[1] - start[1]) / (end[0] - start[0]);
-    if (abs(end[0] - curr[0]) > abs(end[1] - curr[1]))
+    if (fabs(end[0] - curr[0]) > fabs(end[1] - curr[1]))
     {
         curr[0] = end[0] > curr[0] ? curr[0] + 1 : curr[0] - 1;
         curr[1] = end[1] - line_slope * (end[0] - curr[0]);
@@ -107,9 +107,9 @@ static bool is_pixel_in_line(const float curr[2], const float start[2], const fl
 static void adjust_2D_point_to_boundary(float p[2], int width, int height)
 {
     if (p[0] < 0) p[0] = 0;
-    if (p[0] > width) p[0] = width;
+    if (p[0] > width) p[0] = (float)width;
     if (p[1] < 0) p[1] = 0;
-    if (p[1] > height) p[1] = height;
+    if (p[1] > height) p[1] = (float)height;
 }
 
 /* Find projected pixel with unknown depth search along line. */

@@ -8,6 +8,7 @@
 #include <cmath>
 #include "unit-tests-common.h"
 #include "../include/librealsense2/rs_advanced_mode.hpp"
+#include <librealsense2/hpp/rs_types.hpp>
 #include <librealsense2/hpp/rs_frame.hpp>
 #include <iostream>
 #include <chrono>
@@ -126,6 +127,7 @@ struct profile
     int width;
     int height;
     int index;
+    int fps;
 
     bool operator==(const profile& other) const
     {
@@ -144,8 +146,15 @@ struct profile
     {
         return stream < other.stream;
     }
-
 };
+
+std::ostream& operator <<(std::ostream& stream, const profile& cap)
+{
+    stream << cap.stream << " " << cap.stream << " " << cap.format << " "
+    << cap.width << " " << cap.height << " " << cap.index << " " << cap.fps;
+    return stream;
+}
+
 struct device_profiles
 {
     std::vector<profile> streams;
@@ -157,13 +166,13 @@ std::vector<profile>  configure_all_supported_streams(rs2::sensor& sensor, int w
 {
     std::vector<profile> all_profiles =
     {
-        { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, width, height, 0 },
-        { RS2_STREAM_COLOR, RS2_FORMAT_RGB8, width, height, 0 },
-        { RS2_STREAM_INFRARED, RS2_FORMAT_Y8, width, height, 1 },
-        { RS2_STREAM_INFRARED, RS2_FORMAT_Y8, width, height, 2 },
-        { RS2_STREAM_FISHEYE, RS2_FORMAT_RAW8, width, height, 0 },
-        //        {RS2_STREAM_GYRO, 0, 0, 0, RS2_FORMAT_MOTION_XYZ32F, 0},
-        //        {RS2_STREAM_ACCEL, 0,  0, 0, RS2_FORMAT_MOTION_XYZ32F, 0}
+        { RS2_STREAM_DEPTH,     RS2_FORMAT_Z16,           width, height,    0, fps},
+        { RS2_STREAM_COLOR,     RS2_FORMAT_RGB8,          width, height,    0, fps},
+        { RS2_STREAM_INFRARED,  RS2_FORMAT_Y8,            width, height,    1, fps},
+        { RS2_STREAM_INFRARED,  RS2_FORMAT_Y8,            width, height,    2, fps},
+        { RS2_STREAM_FISHEYE,   RS2_FORMAT_RAW8,          width, height,    0, fps},
+        { RS2_STREAM_GYRO,      RS2_FORMAT_MOTION_XYZ32F,   1,      1,      0, 200},
+        { RS2_STREAM_ACCEL,     RS2_FORMAT_MOTION_XYZ32F,   1,      1,      0, 250}
     };
 
     std::vector<profile> profiles;
@@ -174,19 +183,36 @@ std::vector<profile>  configure_all_supported_streams(rs2::sensor& sensor, int w
     {
         if (std::find_if(all_modes.begin(), all_modes.end(), [&](rs2::stream_profile p)
         {
-            auto  video = p.as<rs2::video_stream_profile>();
-            if (!video) return false;
-
-            if (p.fps() == fps &&
+            if (auto  video = p.as<rs2::video_stream_profile>())
+            {
+                if (p.fps() == profile.fps &&
                 p.stream_index() == profile.index &&
                 p.stream_type() == profile.stream &&
                 p.format() == profile.format &&
                 video.width() == profile.width &&
                 video.height() == profile.height)
-            {
-                modes.push_back(p);
-                return true;
+                {
+                    modes.push_back(p);
+                    return true;
+                }
             }
+            else
+            {
+                if (auto  motion = p.as<rs2::motion_stream_profile>())
+                {
+                    if (p.fps() == profile.fps &&
+                        p.stream_index() == profile.index &&
+                        p.stream_type() == profile.stream &&
+                        p.format() == profile.format)
+                        {
+                            modes.push_back(p);
+                            return true;
+                        }
+                }
+                else
+                    return false;
+            }
+
             return false;
         }) != all_modes.end())
         {
@@ -201,8 +227,8 @@ std::vector<profile>  configure_all_supported_streams(rs2::sensor& sensor, int w
 
 std::pair<std::vector<sensor>, std::vector<profile>> configure_all_supported_streams(rs2::device& dev, int width = 640, int height = 480, int fps = 30)
 {
-    std::vector<profile > profiles;
-    std::vector<sensor > sensors;
+    std::vector<profile> profiles;
+    std::vector<sensor> sensors;
     auto sens = dev.query_sensors();
     for (auto s : sens)
     {
@@ -592,6 +618,60 @@ TEST_CASE("Start-Stop stream sequence", "[live][using_pipeline]")
     }
 }
 
+
+TEST_CASE("Start-Stop streaming  - Sensors callbacks API", "[live][using_callbacks]")
+{
+    rs2::context ctx;
+    if (make_context(SECTION_FROM_TEST_NAME, &ctx))
+    {
+        for (auto i = 0; i < 5; i++)
+        {
+            std::vector<rs2::device> list;
+            REQUIRE_NOTHROW(list = ctx.query_devices());
+            REQUIRE(list.size());
+
+            auto dev = list[0];
+            CAPTURE(dev.get_info(RS2_CAMERA_INFO_NAME));
+            disable_sensitive_options_for(dev);
+
+            std::mutex m;
+            int fps = is_usb3(dev) ? 30 : 15; // In USB2 Mode the devices will switch to lower FPS rates
+            std::map<std::string,size_t> frames_per_stream{};
+
+            auto profiles = configure_all_supported_streams(dev,640,480, fps);
+
+            for (auto s : profiles.first)
+            {
+                REQUIRE_NOTHROW(s.start([&m,&frames_per_stream](rs2::frame f)
+                {
+                    std::lock_guard<std::mutex> lock(m);
+                    ++frames_per_stream[f.get_profile().stream_name()];
+                }));
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Stop & flush all active sensors
+            for (auto s : profiles.first)
+            {
+                REQUIRE_NOTHROW(s.stop());
+                REQUIRE_NOTHROW(s.close());
+            }
+
+            // Verify frames arrived for all the profiles specified
+            std::stringstream active_profiles, streams_arrived;
+            active_profiles << "Profiles requested : " << profiles.second.size() << std::endl;
+            for (auto& pf : profiles.second)
+                active_profiles << pf << std::endl;
+            streams_arrived << "Streams recorded : " << frames_per_stream.size() << std::endl;
+            for (auto& frec : frames_per_stream)
+                streams_arrived << frec.first << ": frames = " << frec.second << std::endl;
+
+            CAPTURE(active_profiles.str().c_str());
+            CAPTURE(streams_arrived.str().c_str());
+            REQUIRE(profiles.second.size() == frames_per_stream.size());
+        }
+    }
+}
 
 ////////////////////////////////////////////
 ////// Test basic streaming functionality //
@@ -1643,6 +1723,7 @@ const std::map<dev_type,dev_group> dev_map = {
     /* RS435_RGB/AWGC*/ { { "0B07", true }, e_d400},
                         { { "0B07", false }, e_d400},
     /* DS5U */          { { "0B0C", true }, e_d400},
+    /* D435I */         { { "0B3A", true }, e_d400},
     /*SR300*/           { { "0AA5", true }, e_sr300 },
 };
 
@@ -1728,7 +1809,6 @@ TEST_CASE("Auto-Disabling Controls", "[live][options]")
         } // for (auto&& dev : list)
     }
 }
-
 
 /// The test may fail due to changes in profiles list that do not indicate regression.
 /// TODO - refactoring required to make the test agnostic to changes imposed by librealsense core
@@ -3037,6 +3117,8 @@ static const std::map< dev_type, device_profiles> pipeline_default_configuration
 /* RS405/D460/DS5U*/    { { "0B03", true } ,{ { { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, 1280, 720, 0 },{ RS2_STREAM_INFRARED, RS2_FORMAT_RGB8, 1280, 720, 1 } }, 30, true }},
 /* RS435_RGB/AWGC*/     { { "0B07", true } ,{ { { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, 1280, 720, 0 },{ RS2_STREAM_COLOR, RS2_FORMAT_RGB8, 640, 480, 0 } }, 30, true }},
 /* D435/USB2*/          { { "0B07", false },{ { { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, 640, 480, 0 },{ RS2_STREAM_COLOR, RS2_FORMAT_RGB8, 640, 480, 0 } }, 15, true } },
+// TODO - IMU data profiles are pending FW timestamp fix
+/* D435I/USB3*/         { { "0B3A", true } ,{ { { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, 640, 480, 0 },{ RS2_STREAM_COLOR, RS2_FORMAT_RGB8, 640, 480, 0 } }, 30, true } },
 /* SR300*/              { { "0AA5", true } ,{ { { RS2_STREAM_DEPTH, RS2_FORMAT_Z16, 640, 480, 0 },{ RS2_STREAM_COLOR, RS2_FORMAT_RGB8, 1920, 1080, 0 } }, 30, true } },
 };
 
@@ -3965,6 +4047,224 @@ TEST_CASE("Per-frame metadata sanity check", "[live][!mayfail]") {
         }
     }
 }
+
+// FW Sub-presets API
+TEST_CASE("Alternating Emitter", "[live][options]")
+{
+    rs2::context ctx;
+    //log_to_console(RS2_LOG_SEVERITY_DEBUG);
+
+    if (make_context(SECTION_FROM_TEST_NAME, &ctx, "2.17.1"))
+    {
+        rs2::device dev;
+        rs2::pipeline pipe(ctx);
+        rs2::config cfg;
+        rs2::pipeline_profile profile;
+        REQUIRE_NOTHROW(profile = cfg.resolve(pipe));
+        REQUIRE(profile);
+        REQUIRE_NOTHROW(dev = profile.get_device());
+        REQUIRE(dev);
+        disable_sensitive_options_for(dev);
+        dev_type PID = get_PID(dev);
+        CAPTURE(PID.first);
+        const size_t record_frames = 60;
+
+        // D400 Global Shutter only models
+        if (!librealsense::val_in_range(PID.first, { std::string("0B3A"),std::string("0B07") }))
+        {
+            WARN("Skipping test - the Alternating Emitter feature is not supported for device type: " << PID.first << (PID.second ? " USB3" : " USB2"));
+        }
+        else
+        {
+            auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
+            REQUIRE(depth_sensor.supports(RS2_OPTION_EMITTER_ENABLED));
+            REQUIRE(depth_sensor.supports(RS2_OPTION_EMITTER_ON_OFF));
+
+            GIVEN("Success scenario"){
+
+                REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+                REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+                REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+
+                WHEN("Sequence - idle - flickering on/off")
+                {
+                    THEN("Stress test succeed")
+                    {
+                        for (int i=0 ;i<30; i++)
+                        {
+                            //std::cout << "iteration " << i << " off";
+                            // Revert to original state
+                            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+                            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+                            REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+                            REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                            //std::cout << " - on\n";
+                            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+                            REQUIRE(1 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                            REQUIRE(1 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+                        }
+
+                        // Revert
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+                        REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+                        REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                    }
+                }
+
+                WHEN("Sequence=[idle->:laser_on->: emitter_toggle_on->:streaming]") {
+
+                    REQUIRE(false==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+                    REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                    REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+                    THEN("The emitter is alternating on/off") {
+
+                        std::vector<int> emitter_state;
+                        emitter_state.reserve(record_frames);
+
+                        REQUIRE_NOTHROW(pipe.start(cfg));
+                        REQUIRE(true ==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+
+                        // Warmup - the very first depth frames may not include the alternating pattern
+                        frameset fs;
+                        for (int i=0; i<10; )
+                        {
+                            REQUIRE_NOTHROW(fs = pipe.wait_for_frames());
+                            if (auto f = fs.get_depth_frame())
+                                i++;
+                        }
+
+                        bool even=true;
+                        while (emitter_state.size() < record_frames)
+                        {
+                            size_t last_fn = 0;
+                            REQUIRE_NOTHROW(fs = pipe.wait_for_frames());
+
+                            if (auto f = fs.get_depth_frame())
+                            {
+                                if (((bool(f.get_frame_number()%2)) != even) && f.supports_frame_metadata(RS2_FRAME_METADATA_FRAME_LASER_POWER_MODE))
+                                {
+                                    even = !even;  // Alternating odd/even frame number is sufficient to avoid duplicates
+                                    auto val = static_cast<int>(f.get_frame_metadata(RS2_FRAME_METADATA_FRAME_LASER_POWER_MODE));
+                                    emitter_state.push_back(val);
+                                }
+                            }
+                        }
+
+                        // Reject Laser off command while subpreset is active
+                        REQUIRE(static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED)));
+                        REQUIRE_THROWS(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+
+                        // Allow Laser off command when subpreset is removed
+                        REQUIRE(static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+                        REQUIRE(false==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+
+                        // Re-enable alternating emitter to test stream stop scenario
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+
+                        REQUIRE(static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED)));
+                        REQUIRE(static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+
+                        REQUIRE_NOTHROW(pipe.stop());
+                        REQUIRE(false ==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+                        std::stringstream emitter_results;
+                        std::copy(emitter_state.begin(), emitter_state.end(), std::ostream_iterator<int>(emitter_results));
+                        CAPTURE(emitter_results.str().c_str());
+
+                        // Verify that the laser state is constantly alternating
+                        REQUIRE(std::adjacent_find(emitter_state.begin(), emitter_state.end()) == emitter_state.end());
+                    }
+                }
+
+                WHEN("Sequence=[idle->:streaming-:laser_on->: emitter_toggle_on]") {
+
+                    THEN("The emitter is alternating on/off") {
+
+                        std::vector<int> emitter_state;
+                        emitter_state.reserve(record_frames);
+
+                        REQUIRE_NOTHROW(pipe.start(cfg));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+                        REQUIRE(true ==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+
+                        // Warmup - the very first depth frames may not include the alternating pattern
+                        frameset fs;
+                        for (int i=0; i<10; )
+                        {
+                            REQUIRE_NOTHROW(fs = pipe.wait_for_frames());
+                            if (auto f = fs.get_depth_frame())
+                                i++;
+                        }
+
+                        bool even=true;
+                        while (emitter_state.size() < record_frames)
+                        {
+                            size_t last_fn = 0;
+                            REQUIRE_NOTHROW(fs = pipe.wait_for_frames());
+
+                            if (auto f = fs.get_depth_frame())
+                            {
+                                if (((bool(f.get_frame_number()%2) != even)) && f.supports_frame_metadata(RS2_FRAME_METADATA_FRAME_LASER_POWER_MODE))
+                                {
+                                    even = !even;
+                                    auto val = static_cast<int>(f.get_frame_metadata(RS2_FRAME_METADATA_FRAME_LASER_POWER_MODE));
+                                    emitter_state.push_back(val);
+                                }
+                            }
+                        }
+                        REQUIRE_NOTHROW(pipe.stop());
+
+                        REQUIRE(false ==static_cast<bool>(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF)));
+                        std::stringstream emitter_results;
+                        std::copy(emitter_state.begin(), emitter_state.end(), std::ostream_iterator<int>(emitter_results));
+                        CAPTURE(emitter_results.str().c_str());
+
+                        // Verify that the laser state is constantly alternating
+                        REQUIRE(std::adjacent_find(emitter_state.begin(), emitter_state.end()) == emitter_state.end());
+                    }
+                }
+
+            }
+
+            GIVEN("Negative scenario"){
+
+                REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+                REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+                CAPTURE(depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                CAPTURE(depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+                REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+                REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+
+                WHEN("Sequence=[idle->:laser_off->: emitter_toggle_on]") {
+                    THEN ("Cannot set alternating emitter when laser is set off") {
+                        REQUIRE_THROWS(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+                    }
+                }
+
+                WHEN("Sequence=[idle->:laser_on->:emitter_toggle_on->:laser_off]") {
+                    THEN ("Cannot turn_off laser while the alternating emitter option is on") {
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                        REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,1));
+                        REQUIRE_THROWS(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,1));
+                    }
+                }
+            }
+
+            // Revert to original state
+            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ON_OFF,0));
+            REQUIRE_NOTHROW(depth_sensor.set_option(RS2_OPTION_EMITTER_ENABLED,0));
+            REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ON_OFF));
+            REQUIRE(0 == depth_sensor.get_option(RS2_OPTION_EMITTER_ENABLED));
+        }
+    }
+}
+
 // the tests may incorrectly interpret changes to librealsense-core, namely default profiles selections
 TEST_CASE("All suggested profiles can be opened", "[live][!mayfail]") {
 
@@ -4530,7 +4830,7 @@ TEST_CASE("Pipeline stream with callback", "[live][pipeline][using_pipeline]")
     REQUIRE(frame_from_queue);
 }
 
-TEST_CASE("Syncer sanity with software-device device", "[live][software-device]") {
+TEST_CASE("Syncer sanity with software-device device", "[live][software-device][!mayfail]") {
     rs2::context ctx;
     if (make_context(SECTION_FROM_TEST_NAME, &ctx))
     {
@@ -4575,7 +4875,7 @@ TEST_CASE("Syncer sanity with software-device device", "[live][software-device]"
         });
         t.detach();
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> expected =
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> expected =
         {
             { { RS2_STREAM_DEPTH , 7}},
             { { RS2_STREAM_INFRARED , 5 } },
@@ -4583,13 +4883,13 @@ TEST_CASE("Syncer sanity with software-device device", "[live][software-device]"
             { { RS2_STREAM_DEPTH , 8 },{ RS2_STREAM_INFRARED , 8 } }
         };
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> results;
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> results;
 
         for (auto i = 0; i < expected.size(); i++)
         {
             frameset fs;
             REQUIRE_NOTHROW(fs = sync.wait_for_frames(5000));
-            std::vector < std::pair<rs2_stream, int>> curr;
+            std::vector < std::pair<rs2_stream, uint64_t>> curr;
 
             for (auto f : fs)
             {
@@ -4672,7 +4972,7 @@ TEST_CASE("Syncer clean_inactive_streams by frame number with software-device de
 
         t.detach();
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> expected =
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> expected =
         {
             { { RS2_STREAM_DEPTH , 1 } },
             { { RS2_STREAM_INFRARED , 1 } },
@@ -4683,14 +4983,14 @@ TEST_CASE("Syncer clean_inactive_streams by frame number with software-device de
             { { RS2_STREAM_DEPTH , 7 } },
         };
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> results;
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> results;
 
         for (auto i = 0; i < expected.size(); i++)
         {
             frameset fs;
             CAPTURE(i);
             REQUIRE_NOTHROW(fs = sync.wait_for_frames(5000));
-            std::vector < std::pair<rs2_stream, int>> curr;
+            std::vector < std::pair<rs2_stream, uint64_t>> curr;
 
             for (auto f : fs)
             {
@@ -4813,7 +5113,7 @@ TEST_CASE("Syncer try wait for frames", "[live][software-device]") {
         });
         t.detach();
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> expected =
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> expected =
         {
             { { RS2_STREAM_DEPTH , 7 } },
         { { RS2_STREAM_INFRARED , 5 } },
@@ -4821,12 +5121,12 @@ TEST_CASE("Syncer try wait for frames", "[live][software-device]") {
         { { RS2_STREAM_DEPTH , 8 },{ RS2_STREAM_INFRARED , 8 } }
         };
 
-        std::vector<std::vector<std::pair<rs2_stream, int>>> results;
+        std::vector<std::vector<std::pair<rs2_stream, uint64_t>>> results;
         for (auto i = 0; i < expected.size(); i++)
         {
             frameset fs;
             REQUIRE(sync.try_wait_for_frames(&fs, 5000));
-            std::vector < std::pair<rs2_stream, int>> curr;
+            std::vector < std::pair<rs2_stream, uint64_t>> curr;
 
             for (auto f : fs)
             {
@@ -4857,14 +5157,16 @@ TEST_CASE("Syncer try wait for frames", "[live][software-device]") {
     }
 }
 
-TEST_CASE("Projection from recording", "[software-device][using_pipeline][projection]") {
+// Marked as MayFail due to DSO-11753. TODO -revisit once resolved
+TEST_CASE("Projection from recording", "[software-device][using_pipeline][projection][!mayfail]") {
     rs2::context ctx;
-    if (!make_context(SECTION_FROM_TEST_NAME, &ctx, "2.13.0"))
+    if (!make_context(SECTION_FROM_TEST_NAME, &ctx))
         return;
     std::string folder_name = get_folder_path(special_folder::temp_folder);
     const std::string filename = folder_name + "single_depth_color_640x480.bag";
     REQUIRE(file_exists(filename));
     auto dev = ctx.load_device(filename);
+    dev.set_real_time(false);
 
     syncer sync;
     std::vector<sensor> sensors = dev.query_sensors();
@@ -4881,7 +5183,7 @@ TEST_CASE("Projection from recording", "[software-device][using_pipeline][projec
 
     while (!depth_profile || !color_profile)
     {
-        frameset frames = sync.wait_for_frames(200);
+        frameset frames = sync.wait_for_frames();
         REQUIRE(frames.size() > 0);
         if (frames.size() == 1)
         {
@@ -4924,7 +5226,7 @@ TEST_CASE("Projection from recording", "[software-device][using_pipeline][projec
         for (float j = 0; j < depth_intrin.height; j++)
         {
             float depth_pixel[2] = { i, j };
-            auto udist = depth.as<rs2::depth_frame>().get_distance(depth_pixel[0], depth_pixel[1]);
+            auto udist = depth.as<rs2::depth_frame>().get_distance(static_cast<int>(depth_pixel[0]+0.5f), static_cast<int>(depth_pixel[1]+0.5f));
             if (udist == 0) continue;
 
             float from_pixel[2] = { 0 }, to_pixel[2] = { 0 }, point[3] = { 0 }, other_point[3] = { 0 };
@@ -4933,7 +5235,7 @@ TEST_CASE("Projection from recording", "[software-device][using_pipeline][projec
             rs2_project_point_to_pixel(from_pixel, &color_intrin, other_point);
 
             // Search along a projected beam from 0.1m to 10 meter
-            rs2_project_color_pixel_to_depth_pixel(to_pixel, reinterpret_cast<const uint16_t*>(depth.get_data()), depth_scale, 0.1, 10,
+            rs2_project_color_pixel_to_depth_pixel(to_pixel, reinterpret_cast<const uint16_t*>(depth.get_data()), depth_scale, 0.1f, 10,
                 &depth_intrin, &color_intrin,
                 &color_extrin_to_depth, &depth_extrin_to_color, from_pixel);
 
@@ -5008,7 +5310,7 @@ TEST_CASE("software-device motion stream", "[software-device]")
 
 }
 
-TEST_CASE("Record software-device", "[software-device][record]")
+TEST_CASE("Record software-device", "[software-device][record][!mayfail]")
 {
     const int W = 640;
     const int H = 480;
@@ -5100,3 +5402,332 @@ TEST_CASE("Record software-device", "[software-device][record]")
         pose_frame.timestamp == recorded_pose.get_timestamp()));
 }
 
+void compare(filter first, filter second)
+{
+    CAPTURE(first.get_info(RS2_CAMERA_INFO_NAME));
+    CAPTURE(second.get_info(RS2_CAMERA_INFO_NAME));
+    REQUIRE(strcmp(first.get_info(RS2_CAMERA_INFO_NAME), second.get_info(RS2_CAMERA_INFO_NAME)) == 0);
+
+    auto first_options = first.get_supported_options();
+    auto second_options = second.get_supported_options();
+
+    REQUIRE(first_options.size() == second_options.size());
+
+    REQUIRE(first_options == second_options);
+
+    for (auto i = 0;i < first_options.size();i++)
+    {
+        auto opt = static_cast<rs2_option>(first_options[i]);
+        CAPTURE(opt);
+        CAPTURE(first.get_option(opt));
+        CAPTURE(second.get_option(opt));
+        REQUIRE(first.get_option(opt) == second.get_option(opt));
+    }
+}
+
+void compare(std::vector<filter> first, std::vector<std::shared_ptr<filter>> second)
+{
+    REQUIRE(first.size() == second.size());
+
+    for (auto i = 0;i < first.size();i++)
+    {
+        compare(first[i], (*second[i]));
+    }
+}
+
+TEST_CASE("Sensor get recommended filters", "[live]") {
+    //Require at least one device to be plugged in
+    rs2::context ctx;
+
+    enum sensors
+    {
+        depth,
+        depth_stereo,
+        color
+    };
+
+    std::map<sensors, std::vector<std::shared_ptr<filter>>> sensors_to_filters;
+
+    auto dec_color = std::make_shared<decimation_filter>();
+    dec_color->set_option(RS2_OPTION_STREAM_FILTER, RS2_STREAM_COLOR);
+    dec_color->set_option(RS2_OPTION_STREAM_FORMAT_FILTER, RS2_FORMAT_ANY);
+
+    sensors_to_filters[color] = {
+        dec_color
+    };
+
+    auto dec_depth = std::make_shared<decimation_filter>();
+    dec_depth->set_option(RS2_OPTION_STREAM_FILTER, RS2_STREAM_DEPTH);
+    dec_depth->set_option(RS2_OPTION_STREAM_FORMAT_FILTER, RS2_FORMAT_Z16);
+
+    auto threshold = std::make_shared<threshold_filter>(0.1f, 4.f);
+    auto spatial = std::make_shared<spatial_filter>();
+    auto temporal = std::make_shared<temporal_filter>();
+    auto hole_filling = std::make_shared<hole_filling_filter>();
+
+    sensors_to_filters[depth] = {
+        dec_depth,
+        threshold,
+        spatial,
+        temporal,
+        hole_filling
+    };
+
+    auto depth2disparity = std::make_shared<disparity_transform>(true);
+    auto disparity2depth = std::make_shared<disparity_transform>(false);
+
+    sensors_to_filters[depth_stereo] = {
+        dec_depth,
+        threshold,
+        depth2disparity,
+        spatial,
+        temporal,
+        hole_filling,
+        disparity2depth
+    };
+
+    if (make_context(SECTION_FROM_TEST_NAME, &ctx))
+    {
+        std::vector<sensor> sensors;
+        REQUIRE_NOTHROW(sensors = ctx.query_all_sensors());
+        REQUIRE(sensors.size() > 0);
+
+        for (auto sensor : sensors)
+        {
+            auto processing_blocks = sensor.get_recommended_filters();
+            auto stream_profiles = sensor.get_stream_profiles();
+            if (sensor.is<depth_stereo_sensor>())
+            {
+                compare(processing_blocks, sensors_to_filters[depth_stereo]);
+            }
+            else if (sensor.is<depth_sensor>())
+            {
+                compare(processing_blocks, sensors_to_filters[depth]);
+            }
+            else if (std::find_if(stream_profiles.begin(), stream_profiles.end(), [](stream_profile profile) { return profile.stream_type() == RS2_STREAM_COLOR;}) != stream_profiles.end())
+            {
+                compare(processing_blocks, sensors_to_filters[color]);
+            }
+        }
+    }
+}
+
+TEST_CASE("L500 zero order sanity", "[live]") {
+    //Require at least one device to be plugged in
+    rs2::context ctx;
+    const int RETRIES = 30;
+
+    if (make_context(SECTION_FROM_TEST_NAME, &ctx))
+    {
+        std::vector<sensor> sensors;
+        REQUIRE_NOTHROW(sensors = ctx.query_all_sensors());
+        REQUIRE(sensors.size() > 0);
+
+        for (auto sensor : sensors)
+        {
+            auto processing_blocks = sensor.get_recommended_filters();
+            auto zo = std::find_if(processing_blocks.begin(), processing_blocks.end(), [](filter f)
+            {
+                return f.is<zero_order_invalidation>();
+            });
+
+            if(zo != processing_blocks.end())
+            {
+                rs2::config c;
+                c.enable_stream(RS2_STREAM_DEPTH);
+                c.enable_stream(RS2_STREAM_INFRARED);
+                c.enable_stream(RS2_STREAM_CONFIDENCE);
+
+                rs2::pipeline p;
+                p.start(c);
+                rs2::frame frame;
+
+                std::map<rs2_stream, bool> stream_arrived;
+                stream_arrived[RS2_STREAM_DEPTH] = false;
+                stream_arrived[RS2_STREAM_INFRARED] = false;
+                stream_arrived[RS2_STREAM_CONFIDENCE] = false;
+
+                for (auto i = 0;i < RETRIES;i++)
+                {
+                    REQUIRE_NOTHROW(frame = p.wait_for_frames(15000));
+                    auto res = zo->process(frame);
+                    if (res.is<rs2::frameset>())
+                    {
+                        auto set = res.as<rs2::frameset>();
+                        REQUIRE(set.size() == stream_arrived.size());   // depth, ir, confidance
+                        for (auto&& f : set)
+                        {
+                            stream_arrived[f.get_profile().stream_type()] = true;
+                        }
+                        auto stream_missing = std::find_if(stream_arrived.begin(), stream_arrived.end(), [](std::pair< rs2_stream, bool> item)
+                        {
+                            return !item.second;
+                        });
+
+                        REQUIRE(stream_missing == stream_arrived.end());
+                    }
+                   
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Positional_Sensors_API", "[live]")
+{
+    rs2::context ctx;
+    auto dev_list = ctx.query_devices();
+    log_to_console(RS2_LOG_SEVERITY_WARN);
+    std::this_thread::sleep_for(std::chrono::seconds(5)); // T265 invocation workaround
+
+    if (make_context(SECTION_FROM_TEST_NAME, &ctx, "2.18.1"))
+    {
+        rs2::device dev;
+        rs2::pipeline pipe(ctx);
+        rs2::config cfg;
+        rs2::pipeline_profile profile;
+        REQUIRE_NOTHROW(profile = cfg.resolve(pipe));
+        REQUIRE(profile);
+        REQUIRE_NOTHROW(dev = profile.get_device());
+        REQUIRE(dev);
+        disable_sensitive_options_for(dev);
+        dev_type PID = get_PID(dev);
+        CAPTURE(PID.first);
+
+        // T265 Only
+        if (!librealsense::val_in_range(PID.first, { std::string("0B37")}))
+        {
+            WARN("Skipping test - Applicable for Positional Tracking sensors only. Current device type: " << PID.first << (PID.second ? " USB3" : " USB2"));
+        }
+        else
+        {
+            CAPTURE(dev);
+            REQUIRE(dev.is<rs2::tm2>());
+            REQUIRE_NOTHROW(auto tmp_pos = dev.first<rs2::pose_sensor>());
+            auto pose_snr = dev.first<rs2::pose_sensor>();
+            CAPTURE(pose_snr);
+            REQUIRE(pose_snr);
+            auto wheel_odom_snr = dev.first<rs2::wheel_odometer>();
+            CAPTURE(wheel_odom_snr);
+            REQUIRE(wheel_odom_snr);
+
+            WHEN("Sequence - Streaming.")
+            {
+                THEN("Export/Import must Fail")
+                {
+                    rs2::pipeline_profile pf;
+                    REQUIRE_NOTHROW(pf = pipe.start(cfg));
+                    rs2::device d = pf.get_device();
+                    REQUIRE(d);
+                    auto pose_snr = d.first<rs2::pose_sensor>();
+                    CAPTURE(pose_snr);
+                    REQUIRE(pose_snr);
+
+                    WARN("T2xx Collecting frames started");
+                    rs2::frameset frames;
+                    // The frames are required to generate some initial localization map
+                    for (auto i = 0; i < 200; i++)
+                    {
+                        REQUIRE_NOTHROW(frames = pipe.wait_for_frames());
+                        REQUIRE(frames.size() > 0);
+                    }
+
+                    std::vector<uint8_t> results{}, vnv{};
+                    WARN("T2xx export map");
+                    REQUIRE_THROWS(results = pose_snr.export_localization_map());
+                    CAPTURE(results.size());
+                    REQUIRE(0 == results.size());
+                    WARN("T2xx import map");
+                    REQUIRE_THROWS(pose_snr.import_localization_map({ 0, 1, 2, 3, 4 }));
+                    REQUIRE_NOTHROW(pipe.stop());
+                    WARN("T2xx import/export during streaming finished");
+                }
+            }
+
+            WHEN("Sequence - idle.")
+            {
+                THEN("Export/Import Success")
+                {
+                    std::vector<uint8_t> results, vnv;
+                    REQUIRE_NOTHROW(results = pose_snr.export_localization_map());
+                    CAPTURE(results.size());
+                    REQUIRE(results.size());
+
+                    bool ret = false;
+                    REQUIRE_NOTHROW(ret = pose_snr.import_localization_map(results));
+                    CAPTURE(ret);
+                    REQUIRE(ret);
+                    REQUIRE_NOTHROW(vnv = pose_snr.export_localization_map());
+                    CAPTURE(vnv.size());
+                    REQUIRE(vnv.size());
+                    REQUIRE(vnv == results);
+
+                    //Odometry API
+                    std::ifstream calibrationFile("calibration_odometry.json");
+                    if (calibrationFile)
+                    {
+                        const std::string json_str((std::istreambuf_iterator<char>(calibrationFile)),
+                            std::istreambuf_iterator<char>());
+                        const std::vector<uint8_t> wo_calib(json_str.begin(), json_str.end());
+                        bool b;
+                        REQUIRE_NOTHROW(b = wheel_odom_snr.load_wheel_odometery_config(wo_calib));
+                        REQUIRE(b);
+                    }
+                }
+            }
+
+            WHEN("Sequence - Streaming.")
+            {
+                THEN("Set/Get Static node functionality")
+                {
+                    rs2::pipeline_profile pf;
+                    REQUIRE_NOTHROW(pf = pipe.start(cfg));
+                    rs2::device d = pf.get_device();
+                    REQUIRE(d);
+                    auto pose_snr = d.first<rs2::pose_sensor>();
+                    CAPTURE(pose_snr);
+                    REQUIRE(pose_snr);
+                    auto wo_snr = d.first<rs2::wheel_odometer>();
+                    CAPTURE(wo_snr);
+                    REQUIRE(wo_snr);
+
+                    rs2::frameset frames;
+                    // The frames are required to get pose with sufficient confidence for static node marker
+                    for (auto i = 0; i < 100; i++)
+                    {
+                        REQUIRE_NOTHROW(frames = pipe.wait_for_frames());
+                        REQUIRE(frames.size() > 0);
+                    }
+
+                    rs2_vector init_pose{}, test_pose{ 1,2,3 }, vnv_pose{};
+                    rs2_quaternion init_or{}, test_or{ 4,5,6,7 }, vnv_or{};
+                    auto res = 0;
+                    REQUIRE_NOTHROW(res = pose_snr.set_static_node("wp1", test_pose, test_or));
+                    CAPTURE(res);
+                    REQUIRE(res != 0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    REQUIRE_NOTHROW(res = pose_snr.get_static_node("wp1", vnv_pose, vnv_or));
+                    CAPTURE(vnv_pose);
+                    CAPTURE(vnv_or);
+                    CAPTURE(res);
+                    REQUIRE(test_pose.x == Approx(vnv_pose.x));
+                    REQUIRE(test_pose.y == Approx(vnv_pose.y));
+                    REQUIRE(test_pose.z == Approx(vnv_pose.z));
+                    REQUIRE(test_or.x == Approx(vnv_or.x));
+                    REQUIRE(test_or.y == Approx(vnv_or.y));
+                    REQUIRE(test_or.z == Approx(vnv_or.z));
+                    REQUIRE(test_or.w == Approx(vnv_or.w));
+
+                    //Odometry send data API
+                    bool b;
+                    for (int i = 0; i < 20; i++)
+                    {
+                        REQUIRE_NOTHROW(b = wo_snr.send_wheel_odometry(0, 0, { 1,2,3 }));
+                        REQUIRE(b);
+                    }
+                    REQUIRE_NOTHROW(pipe.stop());
+                }
+            }
+        }
+    }
+}

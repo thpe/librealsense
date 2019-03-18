@@ -68,7 +68,7 @@ int lockf64(int fd, int cmd, off64_t length)
     fl.l_len = length;
 
     if (cmd == F_ULOCK) {
-        fl.l_type == F_UNLCK;
+        fl.l_type = F_UNLCK;
         cmd = F_SETLK64;
         return fcntl(fd, F_SETLK64, &fl);
     }
@@ -515,7 +515,7 @@ namespace librealsense
             DIR * dir = opendir("/sys/class/video4linux");
             if(!dir)
             {
-                LOG_ERROR("Cannot access /sys/class/video4linux");
+                LOG_INFO("Cannot access /sys/class/video4linux");
                 return;
             }
 

@@ -2,7 +2,7 @@
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 
 #include "image.h"
-#include "image_avx.h"
+#include "image-avx.h"
 #include "types.h"
 
 #ifdef RS2_USE_CUDA
@@ -148,15 +148,48 @@ namespace librealsense
     }
 
     template<size_t SIZE>
-    void rotate_270_degrees_clockwise(byte * const dest[], const byte * source, int width, int height)
+    void align_l500_image_optimized(byte * const dest[], const byte * source, int width, int height)
     {
+        auto width_out = height;
+        auto height_out = width;
+
+        auto out = dest[0];
+        byte buffer[8][8 * SIZE]; // = { 0 };
+        for (int i = 0; i <= height-8; i = i + 8)
+        {
+            for (int j = 0; j <= width-8; j = j + 8)
+            {
+                for (int ii = 0; ii < 8; ++ii)
+                {
+                    for (int jj = 0; jj < 8; ++jj)
+                    {
+                        auto source_index = ((j+ jj) + (width * (i + ii))) * SIZE;
+                        memcpy((void*)(&buffer[7-jj][(7-ii) * SIZE]), &source[source_index], SIZE);
+                    }
+                }
+
+                for (int ii = 0; ii < 8; ++ii)
+                {
+                    auto out_index = (((height_out - 8 - j + 1) * width_out) - i - 8 + (ii)* width_out);
+                    memcpy(&out[(out_index)* SIZE], &(buffer[ii]), 8 * SIZE);
+                }
+            }
+        }
+    }
+
+    template<size_t SIZE>
+    void align_l500_image(byte * const dest[], const byte * source, int width, int height)
+    {
+        auto width_out = height;
+        auto height_out = width;
+
         auto out = dest[0];
         for (int i = 0; i < height; ++i)
         {
             auto row_offset = i * width;
             for (int j = 0; j < width; ++j)
             {
-                auto out_index = ((((width - 1) - j) * height) + i) * SIZE;
+                auto out_index = (((height_out - j) * width_out) - i - 1) * SIZE;
                 librealsense::copy((void*)(&out[out_index]), &(source[(row_offset + j) * SIZE]), SIZE);
             }
         }
@@ -172,7 +205,7 @@ namespace librealsense
         };
 #pragma pack(pop)
 
-        rotate_270_degrees_clockwise<1>(dest, source, width, height);
+        align_l500_image<1>(dest, source, width, height);
         auto out = dest[0];
         for (int i = (width - 1), out_i = ((width - 1) * 2); i >= 0; --i, out_i-=2)
         {
@@ -607,6 +640,31 @@ namespace librealsense
     #endif
     }
 
+    void unpack_yuy2_y8(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_Y8>(d, s, w, h);
+    }
+    void unpack_yuy2_y16(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_Y16>(d, s, w, h);
+    }
+    void unpack_yuy2_rgb8(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_RGB8>(d, s, w, h);
+    }
+    void unpack_yuy2_rgba8(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_RGBA8>(d, s, w, h);
+    }
+    void unpack_yuy2_bgr8(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_BGR8>(d, s, w, h);
+    }
+    void unpack_yuy2_bgra8(byte * const d[], const byte * s, int w, int h)
+    {
+        unpack_yuy2<RS2_FORMAT_BGRA8>(d, s, w, h);
+    }
+
     // This templated function unpacks UYVY into RGB8/RGBA8/BGR8/BGRA8, depending on the compile-time parameter FORMAT.
     // It is expected that all branching outside of the loop control variable will be removed due to constant-folding.
     template<rs2_format FORMAT> void unpack_uyvy(byte * const d[], const byte * s, int width, int height)
@@ -974,16 +1032,16 @@ namespace librealsense
 
     const native_pixel_format pf_yuy2                     = { 'YUY2', 1, 2, {  { true,                &unpack_yuy2<RS2_FORMAT_RGB8 >,                { { RS2_STREAM_COLOR,          RS2_FORMAT_RGB8 } } },
                                                                                { true,                &unpack_yuy2<RS2_FORMAT_Y16>,                  { { RS2_STREAM_COLOR,          RS2_FORMAT_Y16 } } },
-                                                                               { false,               &copy_pixels<2>,                               { { RS2_STREAM_COLOR,          RS2_FORMAT_YUYV } } },
+                                                                               { true,                &copy_pixels<2>,                               { { RS2_STREAM_COLOR,          RS2_FORMAT_YUYV } } },
                                                                                { true,                &unpack_yuy2<RS2_FORMAT_RGBA8>,                { { RS2_STREAM_COLOR,          RS2_FORMAT_RGBA8 } } },
                                                                                { true,                &unpack_yuy2<RS2_FORMAT_BGR8 >,                { { RS2_STREAM_COLOR,          RS2_FORMAT_BGR8 } } },
                                                                                { true,                &unpack_yuy2<RS2_FORMAT_BGRA8>,                { { RS2_STREAM_COLOR,          RS2_FORMAT_BGRA8 } } } } };
 
     const native_pixel_format pf_confidence_l500          = { 'C   ', 1, 1, {  { true,                &unpack_confidence,                            { { RS2_STREAM_CONFIDENCE,     RS2_FORMAT_RAW8, l500_confidence_resolution } } },
                                                                                { requires_processing, &copy_pixels<1>,                               { { RS2_STREAM_CONFIDENCE,     RS2_FORMAT_RAW8 } } } } };
-    const native_pixel_format pf_z16_l500                 = { 'Z16 ', 1, 2, {  { true,                &rotate_270_degrees_clockwise<2>,              { { RS2_STREAM_DEPTH,          RS2_FORMAT_Z16,  rotate_resolution } } },
+    const native_pixel_format pf_z16_l500                 = { 'Z16 ', 1, 2, {  { true,                &align_l500_image_optimized<2>,              { { RS2_STREAM_DEPTH,          RS2_FORMAT_Z16,  rotate_resolution } } },
                                                                                { requires_processing, &copy_pixels<2>,                               { { RS2_STREAM_DEPTH,          RS2_FORMAT_Z16                    } } } } };
-    const native_pixel_format pf_y8_l500                  = { 'GREY', 1, 1, {  { true,                &rotate_270_degrees_clockwise<1>,              { { RS2_STREAM_INFRARED,       RS2_FORMAT_Y8,   rotate_resolution } } },
+    const native_pixel_format pf_y8_l500                  = { 'GREY', 1, 1, {  { true,                &align_l500_image_optimized<1>,              { { RS2_STREAM_INFRARED,       RS2_FORMAT_Y8,   rotate_resolution } } },
                                                                                { requires_processing, &copy_pixels<1>,                               { { RS2_STREAM_INFRARED,       RS2_FORMAT_Y8 } } } } };
     const native_pixel_format pf_y8                       = { 'GREY', 1, 1, {  { requires_processing, &copy_pixels<1>,                             { { { RS2_STREAM_INFRARED, 1 },  RS2_FORMAT_Y8  } } } } };
     const native_pixel_format pf_y16                      = { 'Y16 ', 1, 2, {  { true,                &unpack_y16_from_y16_10,                     { { { RS2_STREAM_INFRARED, 1 },  RS2_FORMAT_Y16 } } } } };
@@ -1009,7 +1067,7 @@ namespace librealsense
                                                                                                                                                      { { RS2_STREAM_INFRARED, 1 },  RS2_FORMAT_Y16 } } } } };
 
     const native_pixel_format pf_uyvyl                    = { 'UYVY', 1, 2, {  { true,                &unpack_uyvy<RS2_FORMAT_RGB8 >,                { { RS2_STREAM_INFRARED,       RS2_FORMAT_RGB8 } } },
-                                                                               { false,               &copy_pixels<2>,                               { { RS2_STREAM_INFRARED,       RS2_FORMAT_UYVY } } },
+                                                                               { true,                &copy_pixels<2>,                               { { RS2_STREAM_INFRARED,       RS2_FORMAT_UYVY } } },
                                                                                { true,                &unpack_uyvy<RS2_FORMAT_RGBA8>,                { { RS2_STREAM_INFRARED,       RS2_FORMAT_RGBA8} } },
                                                                                { true,                &unpack_uyvy<RS2_FORMAT_BGR8 >,                { { RS2_STREAM_INFRARED,       RS2_FORMAT_BGR8 } } },
                                                                                { true,                &unpack_uyvy<RS2_FORMAT_BGRA8>,                { { RS2_STREAM_INFRARED,       RS2_FORMAT_BGRA8} } } } };

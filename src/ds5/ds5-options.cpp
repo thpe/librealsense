@@ -75,11 +75,11 @@ namespace librealsense
             is_valid_field = &temperature::is_projector_valid;
             break;
         default:
-            throw invalid_value_exception(to_string() << rs2_option_to_string(_option) << " is not temperature option!");
+            throw invalid_value_exception(to_string() << _ep.get_option_name(_option) << " is not temperature option!");
         }
 
         if (0 == temperature_data.*is_valid_field)
-            LOG_ERROR(rs2_option_to_string(_option) << " value is not valid!");
+            LOG_ERROR(_ep.get_option_name(_option) << " value is not valid!");
 
         return temperature_data.*field;
     }
@@ -103,7 +103,7 @@ namespace librealsense
         case RS2_OPTION_PROJECTOR_TEMPERATURE:
             return "Current Projector Temperature (degree celsius)";
         default:
-            throw invalid_value_exception(to_string() << rs2_option_to_string(_option) << " is not temperature option!");
+            throw invalid_value_exception(to_string() << _ep.get_option_name(_option) << " is not temperature option!");
         }
     }
 
@@ -471,5 +471,37 @@ namespace librealsense
     option_range emitter_on_and_off_option::get_range() const
     {
         return *_range;
+    }
+
+    alternating_emitter_option::alternating_emitter_option(hw_monitor& hwm, sensor_base* ep)
+        : _hwm(hwm), _sensor(ep)
+    {
+        _range = [this]()
+        {
+            return option_range{ 0, 1, 1, 0 };
+        };
+    }
+
+    void alternating_emitter_option::set(float value)
+    {
+        std::vector<uint8_t> pattern{};
+        if (static_cast<int>(value))
+            pattern = ds::alternating_emitter_pattern;
+
+        command cmd(ds::SETSUBPRESET, static_cast<int>(pattern.size()));
+        cmd.data = pattern;
+        auto res = _hwm.send(cmd);
+        _record_action(*this);
+    }
+
+    float alternating_emitter_option::query() const
+    {
+        command cmd(ds::GETSUBPRESETNAME);
+        auto res = _hwm.send(cmd);
+        if (res.size()>20)
+            throw invalid_value_exception("HWMON::GETSUBPRESETNAME invalid size");
+
+        static std::vector<uint8_t> alt_emitter_name(ds::alternating_emitter_pattern.begin()+2,ds::alternating_emitter_pattern.begin()+22);
+        return (alt_emitter_name == res);
     }
 }

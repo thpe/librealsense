@@ -19,6 +19,7 @@ namespace librealsense
         const uint16_t RS410_PID        = 0x0ad2; // ASR
         const uint16_t RS415_PID        = 0x0ad3; // ASRC
         const uint16_t RS430_PID        = 0x0ad4; // AWG
+        const uint16_t RS430I_PID       = 0x0b4b; // D430i
         const uint16_t RS430_MM_PID     = 0x0ad5; // AWGT
         const uint16_t RS_USB2_PID      = 0x0ad6; // USB2
         const uint16_t RS400_IMU_PID    = 0x0af2; // IMU
@@ -49,6 +50,7 @@ namespace librealsense
             ds::RS410_PID,
             ds::RS415_PID,
             ds::RS430_PID,
+            ds::RS430I_PID,
             ds::RS430_MM_PID,
             ds::RS_USB2_PID,
             ds::RS400_IMU_PID,
@@ -71,11 +73,12 @@ namespace librealsense
             ds::RS430_MM_PID,
             ds::RS430_MM_RGB_PID,
             ds::RS435_RGB_PID,
-            ds::RS435I_PID
+            ds::RS435I_PID,
         };
 
         static const std::set<std::uint16_t> hid_sensors_pid = {
-            ds::RS435I_PID
+            ds::RS435I_PID,
+            ds::RS430I_PID
         };
 
         static const std::set<std::uint16_t> fisheye_pid = {
@@ -95,6 +98,7 @@ namespace librealsense
             { RS420_PID,        "Intel RealSense D420"},
             { RS420_MM_PID,     "Intel RealSense D420 with Tracking Module"},
             { RS430_PID,        "Intel RealSense D430"},
+            { RS430I_PID,       "Intel RealSense D430I"},
             { RS430_MM_PID,     "Intel RealSense D430 with Tracking Module"},
             { RS430_MM_RGB_PID, "Intel RealSense D430 with Tracking and RGB Modules"},
             { RS435_RGB_PID,    "Intel RealSense D435"},
@@ -137,7 +141,44 @@ namespace librealsense
             GETRGBAEROI     = 0x76,     // get RGB auto-exposure region of interest
             SET_PWM_ON_OFF  = 0x77,     // set emitter on and off mode
             GET_PWM_ON_OFF  = 0x78,     // get emitter on and off mode
+            SETSUBPRESET    = 0x7B,     // Download sub-preset
+            GETSUBPRESET    = 0x7C,     // Upload the current sub-preset
+            GETSUBPRESETNAME= 0x7D,     // Retrieve sub-preset's name
         };
+
+        #define TOSTRING(arg) #arg
+        #define VAR_ARG_STR(x) TOSTRING(x)
+        #define ENUM2STR(x) case(x):return VAR_ARG_STR(x);
+
+        inline std::string fw_cmd2str(const fw_cmd state)
+        {
+          switch(state)
+          {
+            ENUM2STR(GLD);
+            ENUM2STR(GVD);
+            ENUM2STR(GETINTCAL);
+            ENUM2STR(OBW);
+            ENUM2STR(SET_ADV);
+            ENUM2STR(GET_ADV);
+            ENUM2STR(EN_ADV);
+            ENUM2STR(UAMG);
+            ENUM2STR(SETAEROI);
+            ENUM2STR(GETAEROI);
+            ENUM2STR(MMER);
+            ENUM2STR(GET_EXTRINSICS);
+            ENUM2STR(SET_CAM_SYNC);
+            ENUM2STR(GET_CAM_SYNC);
+            ENUM2STR(SETRGBAEROI);
+            ENUM2STR(GETRGBAEROI);
+            ENUM2STR(SET_PWM_ON_OFF);
+            ENUM2STR(GET_PWM_ON_OFF);
+            ENUM2STR(SETSUBPRESET);
+            ENUM2STR(GETSUBPRESET);
+            ENUM2STR(GETSUBPRESETNAME);
+            default:
+              return (to_string() << "Unrecognized FW command " << state);
+          }
+        }
 
         const int etDepthTableControl = 9; // Identifier of the depth table control
 
@@ -163,6 +204,8 @@ namespace librealsense
             CAP_RGB_SENSOR              = (1u << 1),    // Dedicated RGB sensor
             CAP_FISHEYE_SENSOR          = (1u << 2),    // TM1
             CAP_IMU_SENSOR              = (1u << 3),
+            CAP_GLOBAL_SHUTTER          = (1u << 4),
+            CAP_ROLLING_SHUTTER         = (1u << 5),
             CAP_MAX
         };
 
@@ -171,7 +214,9 @@ namespace librealsense
             { d400_caps::CAP_ACTIVE_PROJECTOR, "Active Projector"  },
             { d400_caps::CAP_RGB_SENSOR,       "RGB Sensor"        },
             { d400_caps::CAP_FISHEYE_SENSOR,   "Fisheye Sensor"    },
-            { d400_caps::CAP_IMU_SENSOR,       "IMU Sensor"        }
+            { d400_caps::CAP_IMU_SENSOR,       "IMU Sensor"        },
+            { d400_caps::CAP_GLOBAL_SHUTTER,   "Global Shutter"    },
+            { d400_caps::CAP_ROLLING_SHUTTER,  "Rolling Shutter"   }
         };
 
         inline d400_caps operator &(const d400_caps lhs, const d400_caps rhs)
@@ -192,7 +237,8 @@ namespace librealsense
         inline std::ostream& operator <<(std::ostream& stream, const d400_caps& cap)
         {
             for (auto i : { d400_caps::CAP_ACTIVE_PROJECTOR,d400_caps::CAP_RGB_SENSOR,
-                            d400_caps::CAP_FISHEYE_SENSOR,  d400_caps::CAP_IMU_SENSOR})
+                            d400_caps::CAP_FISHEYE_SENSOR,  d400_caps::CAP_IMU_SENSOR,
+                            d400_caps::CAP_GLOBAL_SHUTTER,  d400_caps::CAP_ROLLING_SHUTTER })
             {
                 if (i==(i&cap))
                     stream << d400_capabilities_names.at(i) << " ";
@@ -486,6 +532,7 @@ namespace librealsense
             module_serial_offset            = 48,
             fisheye_sensor_lb               = 112,
             fisheye_sensor_hb               = 113,
+            depth_sensor_type               = 166,
             active_projector                = 170,
             rgb_sensor                      = 174,
             imu_sensor                      = 178,
@@ -551,8 +598,8 @@ namespace librealsense
 
         ds5_rect_resolutions width_height_to_ds5_rect_resolutions(uint32_t width, uint32_t height);
 
-        rs2_intrinsics get_intrinsic_by_resolution(const std::vector<uint8_t>& raw_data, calibration_table_id table_id, uint32_t width, uint32_t height, uint32_t fps);
-        rs2_intrinsics get_intrinsic_by_resolution_coefficients_table(const std::vector<uint8_t>& raw_data, uint32_t width, uint32_t height, uint32_t fps);
+        rs2_intrinsics get_intrinsic_by_resolution(const std::vector<uint8_t>& raw_data, calibration_table_id table_id, uint32_t width, uint32_t height);
+        rs2_intrinsics get_intrinsic_by_resolution_coefficients_table(const std::vector<uint8_t>& raw_data, uint32_t width, uint32_t height);
         rs2_intrinsics get_intrinsic_fisheye_table(const std::vector<uint8_t>& raw_data, uint32_t width, uint32_t height);
         pose get_fisheye_extrinsics_data(const std::vector<uint8_t>& raw_data);
         pose get_color_stream_extrinsic(const std::vector<uint8_t>& raw_data);
@@ -622,6 +669,10 @@ namespace librealsense
         };
 
         std::vector<platform::uvc_device_info> filter_device_by_capability(const std::vector<platform::uvc_device_info>& devices, d400_caps caps);
+
+        const std::vector<uint8_t> alternating_emitter_pattern { 0x19, 0,
+            0x41, 0x6c, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x74, 0x69, 0x6e, 0x67, 0x5f, 0x45, 0x6d, 0x69, 0x74, 0x74, 0x65, 0x72, 0,
+            0, 0x2, 0, 0x5, 0, 0x1, 0x1, 0, 0, 0, 0, 0, 0, 0, 0x5, 0, 0x1, 0x1, 0, 0, 0, 0x1, 0, 0, 0 };
 
     } // librealsense::ds
 } // namespace librealsense
