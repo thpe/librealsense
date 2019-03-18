@@ -46,8 +46,8 @@ fi
 
 kernel_branch=$(uname -r | awk -F '[.-]' '{print "v"$1"."$2"."$3}')
 kernel_major_minor=$(uname -r | awk -F '[.-]' '{print "v"$1"."$2}')
-kernel_name="linux-4.19.12"
-kernel_pkg="linux-image-4.19.0-0.bpo.1-amd64-unsigned"
+kernel_name="linux-4.19.16"
+kernel_pkg="linux-image-4.19.0-0.bpo.2-amd64-unsigned"
 
 
 # install source
