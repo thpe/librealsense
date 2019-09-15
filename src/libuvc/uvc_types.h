@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 /* UVC_COLOR_FORMAT_* have been replaced with UVC_FRAME_FORMAT_*. Please use
  * UVC_FRAME_FORMAT_* instead of using these. */
 #define UVC_COLOR_FORMAT_UNKNOWN UVC_FRAME_FORMAT_UNKNOWN
@@ -11,6 +13,16 @@
 #define UVC_COLOR_FORMAT_BGR UVC_FRAME_FORMAT_BGR
 #define UVC_COLOR_FORMAT_MJPEG UVC_FRAME_FORMAT_MJPEG
 #define UVC_COLOR_FORMAT_GRAY8 UVC_FRAME_FORMAT_GRAY8
+
+// convert to standard fourcc codes
+const std::unordered_map<uint32_t, uint32_t> fourcc_map = {
+        { 0x59382020, 0x47524559 },    /* 'GREY' from 'Y8  ' */
+        { 0x52573130, 0x70524141 },    /* 'pRAA' from 'RW10'.*/
+        { 0x32000000, 0x47524559 },    /* 'GREY' from 'L8  ' */
+        { 0x50000000, 0x5a313620 },    /* 'Z16'  from 'D16 ' */
+        { 0x52415738, 0x47524559 },    /* 'GREY' from 'RAW8' */
+        { 0x52573136, 0x42595232 }     /* 'RW16' from 'BYR2' */
+};
 
 enum uvc_device_power_mode {
     UVC_VC_VIDEO_POWER_MODE_FULL = 0x000b,

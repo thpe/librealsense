@@ -1,8 +1,6 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 
-#ifdef RS2_USE_WINUSB_UVC_BACKEND
-
 #if (_MSC_FULL_VER < 180031101)
 #error At least Visual Studio 2013 Update 4 is required to compile this backend
 #endif
@@ -11,9 +9,9 @@
 #define NOMINMAX
 #endif
 
+#include "win/win-helpers.h"
 #include "../types.h"
 #include "win7-hid.h"
-#include "win7-helpers.h"
 
 #include <PortableDeviceTypes.h>
 //#include <PortableDeviceClassExtension.h>
@@ -219,14 +217,8 @@ namespace librealsense
         {
             std::vector<hid_sensor> sensors;
 
-            HRESULT res = S_OK;
-            BSTR fName{};
-            LOG_HR(res = _sensor->GetFriendlyName(&fName));
-            if (FAILED(res)) fName = L"Unidentified HID Sensor";
-
-            sensors.push_back({ std::string(fName, fName + wcslen(fName)) });
-
-            SysFreeString(fName);
+            for (auto& sensor : _hid_profiles)
+                sensors.push_back({ sensor.sensor_name });
 
             return sensors;
         }
@@ -300,7 +292,7 @@ namespace librealsense
 
                                                 uint16_t vid, pid, mi;
                                                 std::string uid, device_guid;
-                                                if (parse_usb_path(vid, pid, mi, uid, device_guid, info.device_path))
+                                                if (parse_usb_path_multiple_interface(vid, pid, mi, uid, info.device_path, device_guid))
                                                 {
                                                     info.unique_id = "*";
                                                     info.pid = to_string() << std::hex << pid;
@@ -377,5 +369,3 @@ namespace librealsense
         }
     }
 }
-
-#endif

@@ -35,6 +35,7 @@ namespace librealsense
         explicit sensor_base(std::string name,
                              device* device, 
                              recommended_proccesing_blocks_interface* owner);
+        virtual ~sensor_base() override { _source.flush(); }
 
         virtual stream_profiles init_stream_profiles() = 0;
 
@@ -54,8 +55,6 @@ namespace librealsense
             return _is_streaming;
         }
 
-        virtual ~sensor_base() { _source.flush(); }
-
         void register_metadata(rs2_frame_metadata_value metadata, std::shared_ptr<md_attribute_parser_base> metadata_parser) const;
 
         void register_on_open(on_open callback)
@@ -68,7 +67,7 @@ namespace librealsense
             _on_before_frame_callback = callback;
         }
 
-        const device_interface& get_device() override;
+        device_interface& get_device() override;
 
         void register_pixel_format(native_pixel_format pf);
         void remove_pixel_format(native_pixel_format pf);
@@ -77,7 +76,7 @@ namespace librealsense
         const std::string& get_info(rs2_camera_info info) const override;
         bool supports_info(rs2_camera_info info) const override;
 
-        processing_blocks get_recommended_processing_blocks() const
+        processing_blocks get_recommended_processing_blocks() const override
         {
             return {};
         }
@@ -122,6 +121,26 @@ namespace librealsense
         virtual void reset() = 0;
     };
 
+    class iio_hid_timestamp_reader : public frame_timestamp_reader
+    {
+        static const int sensors = 2;
+        bool started;
+        mutable std::vector<int64_t> counter;
+        mutable std::recursive_mutex _mtx;
+    public:
+        iio_hid_timestamp_reader();
+
+        void reset() override;
+
+        rs2_time_t get_frame_timestamp(const request_mapping& mode, const platform::frame_object& fo) override;
+
+        bool has_metadata(const request_mapping& mode, const void * metadata, size_t metadata_size) const;
+
+        unsigned long long get_frame_counter(const request_mapping & mode, const platform::frame_object& fo) const override;
+
+        rs2_timestamp_domain get_frame_timestamp_domain(const request_mapping & mode, const platform::frame_object& fo) const override;
+    };
+
     class hid_sensor : public sensor_base
     {
     public:
@@ -132,7 +151,7 @@ namespace librealsense
                             std::vector<std::pair<std::string, stream_profile>> sensor_name_and_hid_profiles,
                             device* dev);
 
-        ~hid_sensor();
+        ~hid_sensor() override;
 
         void open(const stream_profiles& requests) override;
 
@@ -150,9 +169,9 @@ namespace librealsense
         stream_profiles init_stream_profiles() override;
 
     private:
-        const std::map<rs2_stream, uint32_t> stream_and_fourcc = {{RS2_STREAM_GYRO,  'GYRO'},
-                                                                  {RS2_STREAM_ACCEL, 'ACCL'},
-                                                                  {RS2_STREAM_GPIO,  'GPIO'}};
+        const std::map<rs2_stream, uint32_t> stream_and_fourcc = {{RS2_STREAM_GYRO,  rs_fourcc('G','Y','R','O')},
+                                                                  {RS2_STREAM_ACCEL, rs_fourcc('A','C','C','L')},
+                                                                  {RS2_STREAM_GPIO,  rs_fourcc('G','P','I','O')}};
 
         const std::vector<std::pair<std::string, stream_profile>> _sensor_name_and_hid_profiles;
         std::map<rs2_stream, std::map<uint32_t, uint32_t>> _fps_and_sampling_frequency_per_rs2_stream;
@@ -180,7 +199,7 @@ namespace librealsense
         explicit uvc_sensor(std::string name, std::shared_ptr<platform::uvc_device> uvc_device,
                             std::unique_ptr<frame_timestamp_reader> timestamp_reader, device* dev);
 
-        ~uvc_sensor();
+        virtual ~uvc_sensor() override;
 
         void open(const stream_profiles& requests) override;
 

@@ -1,8 +1,6 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 
-#ifdef RS2_USE_WINUSB_UVC_BACKEND
-
 #if (_MSC_FULL_VER < 180031101)
 #error At least Visual Studio 2013 Update 4 is required to compile this backend
 #endif
@@ -24,6 +22,7 @@ The library will be compiled without the metadata support!\n")
 #define NOMINMAX
 #endif
 
+#include "win/win-helpers.h"
 #include "win7-uvc.h"
 #include "win7-usb.h"
 #include "../types.h"
@@ -42,17 +41,6 @@ namespace librealsense
 {
     namespace platform
     {
-        // we are using standard fourcc codes to represent formats, while MF is using GUIDs
-        // occasionally there is a mismatch between the code and the guid data
-        const std::unordered_map<uint32_t, uint32_t> fourcc_map = {
-            { 0x59382020, 0x47524559 },    /* 'GREY' from 'Y8  ' */
-            { 0x52573130, 0x70524141 },    /* 'pRAA' from 'RW10'.*/
-            { 0x32000000, 0x47524559 },    /* 'GREY' from 'L8  ' */
-            { 0x50000000, 0x5a313620 },    /* 'Z16'  from 'D16 ' */
-            { 0x52415738, 0x47524559 },    /* 'GREY' from 'RAW8' */
-            { 0x52573136, 0x42595232 }     /* 'RW16' from 'BYR2' */
-        };
-
         bool win7_uvc_device::is_connected(const uvc_device_info& info)
         {
             auto result = false;
@@ -356,7 +344,7 @@ namespace librealsense
                 {
                     std::string path(id.begin(), id.end());
                     uint16_t vid, pid, mi; std::string unique_id, device_guid;
-                    if (!parse_usb_path(vid, pid, mi, unique_id, device_guid, path)) continue;
+                    if (!parse_usb_path_multiple_interface(vid, pid, mi, unique_id, path, device_guid)) continue;
 
                     uvc_device_info info{ };
                     info.id = path; 
@@ -396,7 +384,7 @@ namespace librealsense
 
                 // Return list of all connected IVCAM devices from uvc_interface name
                 uint16_t vid, pid, mi; std::string unique_id, device_guid;
-                if (!parse_usb_path(vid, pid, mi, unique_id, device_guid, this->_info.device_path))
+                if (!parse_usb_path_multiple_interface(vid, pid, mi, unique_id, this->_info.device_path, device_guid))
                 {
                     throw std::runtime_error("Failed to parse USB path!");
                 }
@@ -410,7 +398,8 @@ namespace librealsense
                     winusb_uvc_device *device = device_list[i];
 
                     // initializing and filling all fields of winsub_device device_list[0]
-                    winusb_open(device);
+                    if (winusb_open(device) != UVC_SUCCESS)
+                        continue;
 
                     if (device->deviceData.ctrl_if.bInterfaceNumber == mi)
                     {
@@ -433,18 +422,29 @@ namespace librealsense
                             _extension_unit = eu->bUnitID;
                         }
 
-                        _keep_pulling_interrupts = true;
-                        _interrupt_polling_thread = std::shared_ptr<std::thread>(new std::thread([this]() {
-                            poll_interrupts();
-                        }), [this](std::thread* ptr) { 
-                            if (ptr)
-                            {
-                                _keep_pulling_interrupts = false;
-                                ptr->join();
-                                delete ptr;
-                            }
-                        });
+                        // WinUsb_SetPipePolicy function sets the policy for a specific pipe associated with an endpoint on the device
+                        // PIPE_TRANSFER_TIMEOUT: Waits for a time-out interval before canceling the request
+                        ULONG timeout_milliseconds = 100;
+                        if (WinUsb_SetPipePolicy(_device->winusbHandle, _device->deviceData.ctrl_if.bEndpointAddress, PIPE_TRANSFER_TIMEOUT, sizeof(timeout_milliseconds), &timeout_milliseconds) == FALSE)
+                        {
+                            free(device_list);
+                            throw std::runtime_error("Failed to set timeout policy!");
+                        }
 
+                        if (_device->deviceData.ctrl_if.bEndpointAddress >= 0x80) // Poll Upstream endpoints only
+                        {
+                            _keep_pulling_interrupts = true;
+                            _interrupt_polling_thread = std::shared_ptr<std::thread>(new std::thread([device, this]() {
+                                poll_interrupts();
+                            }), [this](std::thread* ptr) {
+                                if (ptr)
+                                {
+                                    _keep_pulling_interrupts = false;
+                                    ptr->join();
+                                    delete ptr;
+                                }
+                            });
+                        }
                         _power_state = D0;
                         free(device_list);
 
@@ -512,7 +512,8 @@ namespace librealsense
             }
             try
             {
-                if (!get_usb_descriptors(info.vid, info.pid, info.unique_id, _location, _device_usb_spec))
+                std::string device_serial = "";
+                if (!get_usb_descriptors(info.vid, info.pid, info.unique_id, _location, _device_usb_spec, device_serial))
                 {
                     LOG_WARNING("Could not retrieve USB descriptor for device " << std::hex << info.vid << ":"
                         << info.pid << " , id:" << info.unique_id);
@@ -607,12 +608,14 @@ namespace librealsense
 
             winusb_free_formats(formats);
 
-            callback_context *context = new callback_context();
-            context->_callback = callback;
-            context->_this = this;
-            context->_profile = profile;
+            _cb_context = std::make_shared<callback_context>();
+            _cb_context->_callback = callback;
+            _cb_context->_profile = profile;
+            _cb_context->_this = this;
 
-            winusb_start_streaming(_device.get(), &ctrl, internal_winusb_uvc_callback, context, 0);
+            auto sts = winusb_start_streaming(_device.get(), &ctrl, internal_winusb_uvc_callback, _cb_context.get(), 0);
+            if(sts != UVC_SUCCESS)
+                throw std::runtime_error("Failed to start streaming!");
         }
 
         void win7_uvc_device::stream_on(std::function<void(const notification& n)> error_handler)
@@ -725,5 +728,3 @@ namespace librealsense
         }
     }
 }
-
-#endif

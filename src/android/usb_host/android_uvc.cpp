@@ -4,24 +4,34 @@
 #ifdef RS2_USE_ANDROID_BACKEND
 
 #include "android_uvc.h"
-#include "device_watcher.h"
-#include "libuvc/utlist.h"
+#include "../device_watcher.h"
 
-#include "concurrency.h"
+#include "../../concurrency.h"
 #include "../../types.h"
+#include "../../libuvc/uvc_types.h"
 #include "../../libuvc/utlist.h"
+#include "../../usb/usb-types.h"
+#include "../../usb/usb-device.h"
+#include "../../usbhost/messenger-usbhost.h"
 
 #include <vector>
 #include <thread>
 #include <atomic>
 #include <zconf.h>
 
+const bool USE_URB = true;
+const int DEQUEUE_MILLISECONDS_TIMEOUT = 50;
+const int FIRST_FRAME_MILLISECONDS_TIMEOUT = 2000;
+const int STREAMING_WATCHER_MILLISECONDS_TIMEOUT = 1000;
+const int STREAMING_BULK_TRANSFER_MILLISECONDS_TIMEOUT = 1000;
+const int UVC_PAYLOAD_MAX_HEADER_LENGTH = 256;
+
+using namespace librealsense;
+
 // Data structures for Backend-Frontend queue:
 struct frame;
 // We keep no more then 2 frames in between frontend and backend
-typedef librealsense::small_heap<frame, 2> frames_archive;
-
-using namespace librealsense::usb_host;
+typedef librealsense::small_heap<frame, 10> frames_archive;
 
 struct frame {
     frame() {}
@@ -38,7 +48,6 @@ struct frame {
     librealsense::platform::frame_object fo;
     frames_archive *owner; // Keep pointer to owner for light-deleter
 };
-
 
 void cleanup_frame(frame *ptr) {
     if (ptr) ptr->owner->deallocate(ptr);
@@ -632,14 +641,17 @@ uvc_error_t update_stream_if_handle(usbhost_uvc_device *devh, int interface_idx)
 
     DL_FOREACH(devh->deviceData.stream_ifs, stream_if) {
         if (stream_if->bInterfaceNumber == interface_idx)
-            if (!stream_if->interfaceHandle.device && interface_idx < MAX_USB_INTERFACES) {
+            if (!stream_if->interface && interface_idx < MAX_USB_INTERFACES) {
                 // usbhost_GetAssociatedInterface returns the associated interface (Video stream interface which is associated to Video control interface)
                 // A value of 0 indicates the first associated interface (Video Stream 1), a value of 1 indicates the second associated interface (video stream 2)
                 // WinUsbInterfaceNumber is the actual interface number taken from the USB config descriptor
                 // A value of 0 indicates the first interface (Video Control Interface), A value of 1 indicates the first associated interface (Video Stream 1)
                 // For this reason, when calling to usbhost_GetAssociatedInterface, we must decrease 1 to receive the associated interface
-                stream_if->interfaceHandle.device = devh->device;
-                stream_if->interfaceHandle.interface_index = interface_idx;
+                auto intfs = devh->device->get_interfaces();
+                auto it = std::find_if(intfs.begin(), intfs.end(),
+                                       [&](const librealsense::platform::rs_usb_interface& i) { return i->get_number() == interface_idx; });
+                if (it != intfs.end())
+                    stream_if->interface = *it;
             }
     }
     return UVC_SUCCESS;
@@ -732,9 +744,8 @@ uvc_error_t usbhost_get_available_formats_all(usbhost_uvc_device *devh, uvc_form
                     uvc_format_t *cur_format = (uvc_format_t *) malloc(sizeof(uvc_format_t));
                     cur_format->height = frame_desc->wHeight;
                     cur_format->width = frame_desc->wWidth;
-                    cur_format->fourcc = SWAP_UINT32(*(const uint32_t *) format->guidFormat);
-                    if(1496850464 == cur_format->fourcc)
-                        cur_format->fourcc = 1196574041; //TODO
+                    auto temp = SWAP_UINT32(*(const uint32_t *) format->guidFormat);
+                    cur_format->fourcc = fourcc_map.count(temp) ? fourcc_map.at(temp) : temp;
                     cur_format->interfaceNumber = stream_if->bInterfaceNumber;
 
                     cur_format->fps = 10000000 / *interval_ptr;
@@ -795,128 +806,58 @@ uvc_frame_desc_t *usbhost_uvc_find_frame_desc_stream(usbhost_uvc_stream_handle_t
     return usbhost_uvc_find_frame_desc_stream_if(strmh->stream_if, format_id, frame_id);
 }
 
-
-void usbhost_uvc_swap_buffers(usbhost_uvc_stream_handle_t *strmh, size_t leftover = 0) {
-    uint8_t *tmp_buf;
-
-    //pthread_mutex_lock(&strmh->cb_mutex);
-
-    /* swap the buffers */
-    tmp_buf = strmh->holdbuf;
-    strmh->hold_bytes = strmh->got_bytes;
-    strmh->holdbuf = strmh->outbuf;
-    strmh->outbuf = tmp_buf;
-    strmh->hold_last_scr = strmh->last_scr;
-    strmh->hold_pts = strmh->pts;
-    strmh->hold_seq = strmh->seq;
-
-    //pthread_cond_broadcast(&strmh->cb_cond);
-    //pthread_mutex_unlock(&strmh->cb_mutex);
-
-    strmh->seq++;
-    strmh->got_bytes = leftover;
-    strmh->last_scr = 0;
-    strmh->pts = 0;
-}
-
-void usbhost_uvc_process_payload(usbhost_uvc_stream_handle_t *strmh,
-                                 frames_archive *archive,
-                                 frames_queue *queue) {
-    uint8_t header_info;
-    size_t payload_len = strmh->got_bytes;
-    uint8_t *payload = strmh->outbuf;
+void usbhost_uvc_process_bulk_payload(frame_ptr fp, size_t payload_len, frames_queue& queue) {
 
     /* ignore empty payload transfers */
-    if (payload_len == 0)
+    if (!fp || payload_len < 2)
         return;
-    uint8_t header_len = payload[0];
 
+    uint8_t header_len = fp->pixels[0];
+    uint8_t header_info = fp->pixels[1];
+
+    size_t data_len = payload_len - header_len;
+
+    if (header_info & 0x40)
+    {
+        LOG_ERROR("bad packet: error bit set");
+        return;
+    }
     if (header_len > payload_len)
     {
         LOG_ERROR("bogus packet: actual_len=" << payload_len << ", header_len=" << header_len);
         return;
     }
 
-    size_t data_len = strmh->got_bytes - header_len;
 
-    if (header_len < 2) {
-        header_info = 0;
-    }
-    else {
-        /** @todo we should be checking the end-of-header bit */
-        size_t variable_offset = 2;
+    LOG_DEBUG("Passing packet to user CB with size " << (data_len + header_len));
+    librealsense::platform::frame_object fo{ data_len, header_len,
+                                             fp->pixels.data() + header_len , fp->pixels.data() };
+    fp->fo = fo;
 
-        header_info = payload[1];
-
-        if (header_info & 0x40) {
-            LOG_ERROR("bad packet: error bit set");
-            return;
-        }
-
-        if (strmh->fid != (header_info & 1) && strmh->got_bytes != 0) {
-            /* The frame ID bit was flipped, but we have image data sitting
-            around from prior transfers. This means the camera didn't send
-            an EOF for the last transfer of the previous frame. */
-//            LOG_DEBUG("complete buffer : length " << strmh->got_bytes);
-            usbhost_uvc_swap_buffers(strmh);
-        }
-
-        strmh->fid = header_info & 1;
-
-        if (header_info & (1 << 2)) {
-            strmh->pts = DW_TO_INT(payload + variable_offset);
-            variable_offset += 4;
-        }
-
-        if (header_info & (1 << 3)) {
-            /** @todo read the SOF token counter */
-            strmh->last_scr = DW_TO_INT(payload + variable_offset);
-            variable_offset += 6;
-        }
-    }
-
-    if ((data_len > 0) && (strmh->cur_ctrl.dwMaxVideoFrameSize == (data_len)))
-    {
-        //if (header_info & (1 << 1)) { // Temp patch to allow old firmware
-        /* The EOF bit is set, so publish the complete frame */
-        usbhost_uvc_swap_buffers(strmh);
-
-        auto frame_p = archive->allocate();
-        if (frame_p)
-        {
-            frame_ptr fp(frame_p, &cleanup_frame);
-
-            memcpy(fp->pixels.data(), payload, data_len + header_len);
-
-            LOG_DEBUG("Passing packet to user CB with size " << (data_len + header_len));
-            librealsense::platform::frame_object fo{ data_len, header_len,
-                                                     fp->pixels.data() + header_len , fp->pixels.data() };
-            fp->fo = fo;
-
-            queue->enqueue(std::move(fp));
-        }
-        else
-        {
-            LOG_WARNING("WinUSB backend is dropping a frame because librealsense wasn't fast enough");
-        }
-    }
+    queue.enqueue(std::move(fp));
 }
 
-void stream_thread(usbhost_uvc_stream_context *strctx) {
-    auto dev = strctx->stream->stream_if->interfaceHandle.device;
+void stream_thread_bulk(usbhost_uvc_stream_context *strctx) {
+    auto inf = strctx->stream->stream_if->interface;
+    auto dev = strctx->stream->devh->device;
+    auto messenger = dev->open();
 
-    auto pipe = dev->get_pipe(strctx->endpoint);
-    pipe->reset();
+    auto read_ep = inf->first_endpoint(librealsense::platform::RS2_USB_ENDPOINT_DIRECTION_READ);
+    uint32_t reset_ep_timeout = 100;
+    messenger->reset_endpoint(read_ep, reset_ep_timeout);
 
     frames_archive archive;
     std::atomic_bool keep_sending_callbacks(true);
     frames_queue queue;
 
+    uint32_t read_buff_length = UVC_PAYLOAD_MAX_HEADER_LENGTH + strctx->stream->cur_ctrl.dwMaxVideoFrameSize;
+    LOG_INFO("endpoint " << (int)read_ep->get_address() << " read buffer size: " << read_buff_length);
+
     // Get all pointers from archive and initialize their content
     std::vector<frame *> frames;
     for (auto i = 0; i < frames_archive::CAPACITY; i++) {
         auto ptr = archive.allocate();
-        ptr->pixels.resize(strctx->maxVideoBufferSize, 0);
+        ptr->pixels.resize(read_buff_length, 0);
         ptr->owner = &archive;
         frames.push_back(ptr);
     }
@@ -928,27 +869,48 @@ void stream_thread(usbhost_uvc_stream_context *strctx) {
     std::thread t([&]() {
         while (keep_sending_callbacks) {
             frame_ptr fp(nullptr, [](frame *) {});
-            if (queue.dequeue(&fp, 50)) {
+            if (queue.dequeue(&fp, DEQUEUE_MILLISECONDS_TIMEOUT)) {
                 strctx->stream->user_cb(&fp->fo, strctx->stream->user_ptr);
             }
         }
     });
     LOG_DEBUG("Transfer thread started for endpoint address: " << strctx->endpoint);
+    bool fatal_error = false;
     do {
-        int res = pipe->read_pipe(strctx->stream->outbuf, LIBUVC_XFER_BUF_SIZE, 1000);
-        if(res < 0)
+        frame_ptr fp = frame_ptr(archive.allocate(), &cleanup_frame);
+        if(!fp)
+            continue;
+        auto i = strctx->stream->stream_if->interface;
+        uint32_t transferred = 0;
+        auto sts = messenger->bulk_transfer(read_ep, fp->pixels.data(), read_buff_length, transferred, STREAMING_BULK_TRANSFER_MILLISECONDS_TIMEOUT);
+//        LOG_INFO("endpoint: " << (int)read_ep->get_address() << ", sts: " << (int)sts << ", expected: " << (int)read_buff_length << ", actual: " << (int)transferred);
+        switch(sts)
         {
-            LOG_ERROR("Read pipe returned error and was clear halted ERROR:" << strerror(errno));
-            if(pipe->reset())
-                continue;
-            break;
+            case librealsense::platform::RS2_USB_STATUS_NO_MEM:
+                LOG_ERROR("USB transfer failed, the max read buffer size is smaller than the current resolution requires, try to configure lower resolution");
+            case librealsense::platform::RS2_USB_STATUS_OVERFLOW:
+            case librealsense::platform::RS2_USB_STATUS_NO_DEVICE:
+                fatal_error = true;
+                break;
+            case librealsense::platform::RS2_USB_STATUS_PIPE:
+            case librealsense::platform::RS2_USB_STATUS_INVALID_PARAM:
+                messenger->reset_endpoint(read_ep, reset_ep_timeout);
+                break;
+            case librealsense::platform::RS2_USB_STATUS_SUCCESS:
+                //we support only bulk transfer mode, so we expect the frame to arrive in a single payload
+                if(transferred > 0)
+                {
+                    if(transferred == (fp->pixels[0] + strctx->stream->cur_ctrl.dwMaxVideoFrameSize))
+                        usbhost_uvc_process_bulk_payload(std::move(fp), transferred, queue);
+                }
+                break;
+            default:
+                break;
         }
-        strctx->stream->got_bytes = res;
-        usbhost_uvc_process_payload(strctx->stream, &archive, &queue);
-    } while (strctx->stream->running);
+    } while (!fatal_error && strctx->stream->running);
 
     int ep = strctx->endpoint;
-    pipe->reset();
+    messenger->reset_endpoint(read_ep, reset_ep_timeout);
     free(strctx);
 
     queue.clear();
@@ -962,6 +924,170 @@ void stream_thread(usbhost_uvc_stream_context *strctx) {
     LOG_DEBUG("Transfer thread stopped for endpoint address: " << ep);
 };
 
+std::shared_ptr<usb_request> create_request(
+        std::shared_ptr<librealsense::platform::usb_device_usbhost> dev,
+        usb_endpoint_descriptor desc,
+        std::shared_ptr<platform::usb_request_callback> callback)
+{
+    auto rv = std::shared_ptr<usb_request>(usb_request_new(dev->get_handle(), &desc),
+                                                [](usb_request* req){usb_request_free(req);});
+    if(!rv){
+        LOG_ERROR("invalid USB request");
+        return nullptr;
+    }
+    rv->client_data = callback.get();
+
+    return rv;
+}
+
+void stream_thread_urb(usbhost_uvc_stream_context *strctx) {
+    auto inf = strctx->stream->stream_if->interface;
+    auto dev = strctx->stream->devh->device;
+    auto messenger = std::static_pointer_cast<platform::usb_messenger_usbhost>(dev->open());
+
+    auto read_ep = std::static_pointer_cast<platform::usb_endpoint_usbhost>
+            (inf->first_endpoint(platform::RS2_USB_ENDPOINT_DIRECTION_READ));
+
+    uint32_t reset_ep_timeout = 100;
+    messenger->reset_endpoint(read_ep, reset_ep_timeout);
+
+    frames_archive archive;
+    std::atomic_bool keep_sending_callbacks(true);
+    frames_queue queue;
+
+    uint32_t read_buff_length = UVC_PAYLOAD_MAX_HEADER_LENGTH + strctx->stream->cur_ctrl.dwMaxVideoFrameSize;
+    LOG_INFO("endpoint " << (int)read_ep->get_address() << " read buffer size: " << read_buff_length);
+
+    // Get all pointers from archive and initialize their content
+    std::vector<frame *> frames;
+    for (auto i = 0; i < frames_archive::CAPACITY; i++) {
+        auto ptr = archive.allocate();
+        ptr->pixels.resize(read_buff_length, 0);
+        ptr->owner = &archive;
+        frames.push_back(ptr);
+    }
+
+    for (auto ptr : frames) {
+        archive.deallocate(ptr);
+    }
+
+    std::thread t([&]() {
+        while (keep_sending_callbacks) {
+            frame_ptr fp(nullptr, [](frame *) {});
+            if (queue.dequeue(&fp, DEQUEUE_MILLISECONDS_TIMEOUT)) {
+                strctx->stream->user_cb(&fp->fo, strctx->stream->user_ptr);
+            }
+        }
+    });
+
+    frame_ptr fp = frame_ptr(archive.allocate(), &cleanup_frame);
+
+    auto desc = read_ep->get_descriptor();
+    std::shared_ptr<usb_request> request;
+
+    bool fatal_error = false;
+    uint32_t frame_count = 0;
+    uint32_t prev_frame_count = 0;
+    int active_request_count = 0;
+    dispatcher request_dispatcher(1);
+
+    std::function<void()> queue_request = [&]()
+    {
+        if(fatal_error || !strctx->stream->running){
+            return;
+        }
+        request_dispatcher.invoke([&](dispatcher::cancellable_timer c)
+        {
+            fp = frame_ptr(archive.allocate(), &cleanup_frame);
+            if(!fp)
+                return;
+            request->buffer = fp->pixels.data();
+            request->buffer_length = fp->pixels.size();
+
+            auto sts =  messenger->submit_request(request);
+            switch(sts)
+            {
+                case platform::RS2_USB_STATUS_SUCCESS:
+                    active_request_count++;
+                    return;
+                case platform::RS2_USB_STATUS_OVERFLOW:
+                case platform::RS2_USB_STATUS_NO_DEVICE:
+                case platform::RS2_USB_STATUS_NO_MEM:
+                    fatal_error = true;
+                    return;
+                default:
+                    messenger->reset_endpoint(read_ep, reset_ep_timeout);
+                    queue_request();
+                    break;
+            }
+        });
+    };
+
+    request_dispatcher.start();
+
+    auto callback = std::make_shared<platform::usb_request_callback>([&](usb_request* r)
+    {
+        if(r)
+            active_request_count--;
+        if(r && r->actual_length >= strctx->stream->cur_ctrl.dwMaxVideoFrameSize)
+        {
+            frame_count++;
+            usbhost_uvc_process_bulk_payload(std::move(fp), r->actual_length, queue);
+        }
+
+        queue_request();
+    });
+
+    request = create_request(dev, desc, callback);
+    if(!request)
+        return;
+    callback->callback(nullptr);
+
+    int timeout = FIRST_FRAME_MILLISECONDS_TIMEOUT;
+    while(!fatal_error && strctx->stream->running)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+
+        if(frame_count > prev_frame_count) {
+            timeout = STREAMING_WATCHER_MILLISECONDS_TIMEOUT;
+        }
+        else{
+            messenger->reset_endpoint(read_ep, reset_ep_timeout);
+        }
+
+        prev_frame_count = frame_count;
+    }
+
+    int itr = 10;
+    while(!fatal_error && active_request_count && itr--){
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    callback->cancel();
+
+    if(active_request_count)
+        messenger->cancel_request(request);
+    LOG_INFO("streaming done on read endpoint: " << (int)read_ep->get_address() << ", active requests count: " << active_request_count);
+
+    messenger->reset_endpoint(read_ep, reset_ep_timeout);
+    free(strctx);
+    queue.clear();
+    archive.stop_allocation();
+    fp.reset();
+    archive.wait_until_empty();
+    keep_sending_callbacks = false;
+
+    LOG_INFO("start join stream_thread");
+    t.join();
+    LOG_INFO("Transfer thread stopped for endpoint address: " << (int)read_ep->get_address());
+};
+
+void stream_thread(usbhost_uvc_stream_context *strctx){
+    if(USE_URB)
+        stream_thread_urb(strctx);
+    else
+        stream_thread_bulk(strctx);
+}
 uvc_error_t usbhost_uvc_stream_start(
         usbhost_uvc_stream_handle_t *strmh,
         usbhost_uvc_frame_callback_t *cb,
@@ -1003,8 +1129,6 @@ uvc_error_t usbhost_uvc_stream_start(
 
     usbhost_uvc_stream_context *streamctx = new usbhost_uvc_stream_context;
 
-    //printf("Starting stream on EP = 0x%X, interface 0x%X\n", format_desc->parent->bEndpointAddress, iface);
-
     streamctx->stream = strmh;
     streamctx->endpoint = format_desc->parent->bEndpointAddress;
     streamctx->iface = iface;
@@ -1045,7 +1169,7 @@ void usbhost_uvc_stream_close(usbhost_uvc_stream_handle_t *strmh) {
 }
 
 uvc_error_t usbhost_uvc_stream_open_ctrl(usbhost_uvc_device *devh, usbhost_uvc_stream_handle_t **strmhp,
-                             uvc_stream_ctrl_t *ctrl);
+                                         uvc_stream_ctrl_t *ctrl);
 
 uvc_error_t usbhost_start_streaming(usbhost_uvc_device *devh, uvc_stream_ctrl_t *ctrl,
                                     usbhost_uvc_frame_callback_t *cb, void *user_ptr,
@@ -1367,8 +1491,8 @@ uvc_error_t usbhost_get_stream_ctrl_format_size(
         uvc_frame_desc_t *frame;
         //TODO
         auto val = SWAP_UINT32(*(const uint32_t *) format->guidFormat);
-        if(1496850464 == val)
-            val = 1196574041;
+        if(fourcc_map.count(val))
+            val = fourcc_map.at(val);
 
         if (fourcc != val)
             continue;

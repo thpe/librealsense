@@ -3,7 +3,7 @@
 #pragma once
 
 #include "../backend.h"
-#include "win7-helpers.h"
+#include "win/win-helpers.h"
 #include "winusb_uvc/winusb_uvc.h"
 
 #include <strmif.h>
@@ -30,6 +30,7 @@ namespace librealsense
     namespace platform
     {
         class win7_backend;
+        struct callback_context;
 
         struct profile_and_callback
         {
@@ -99,6 +100,7 @@ namespace librealsense
             std::mutex                              _streams_mutex;
 
             std::shared_ptr<const win7_backend>      _backend;
+            std::shared_ptr<callback_context>        _cb_context;
 
             std::string                             _location;
             usb_spec                                _device_usb_spec;

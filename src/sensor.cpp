@@ -12,10 +12,12 @@
 #include "stream.h"
 #include "sensor.h"
 #include "proc/decimation-filter.h"
+#include "global_timestamp_reader.h"
+#include "metadata.h"
 
 namespace librealsense
 {
-    sensor_base::sensor_base(std::string name, device* dev, 
+    sensor_base::sensor_base(std::string name, device* dev,
         recommended_proccesing_blocks_interface* owner)
         : recommended_proccesing_blocks_base(owner),
         _is_streaming(false),
@@ -307,7 +309,6 @@ namespace librealsense
         std::unordered_set<std::shared_ptr<video_stream_profile>> results;
         std::set<uint32_t> unregistered_formats;
         std::set<uint32_t> supported_formats;
-        std::set<uint32_t> registered_formats;
 
         power on(std::dynamic_pointer_cast<uvc_sensor>(shared_from_this()));
         if (_uvc_profiles.empty()){}
@@ -354,7 +355,7 @@ namespace librealsense
             }
 
             ss << "]; Supported: [ ";
-            for (auto& elem : registered_formats)
+            for (auto& elem : supported_formats)
             {
                 uint32_t device_fourcc = reinterpret_cast<const big_endian<uint32_t>&>(elem);
                 char fourcc[sizeof(device_fourcc) + 1];
@@ -363,7 +364,7 @@ namespace librealsense
                 ss << fourcc << " ";
             }
             ss << "]";
-            LOG_WARNING(ss.str());
+            LOG_INFO(ss.str());
         }
 
         // Sort the results to make sure that the user will receive predictable deterministic output from the API
@@ -395,7 +396,7 @@ namespace librealsense
         }
     }
 
-    const device_interface& sensor_base::get_device()
+    device_interface& sensor_base::get_device()
     {
         return *_owner;
     }
@@ -532,7 +533,7 @@ namespace librealsense
                     // Unpack the frame
                     if (requires_processing && (dest.size() > 0))
                     {
-                        unpacker.unpack(dest.data(), reinterpret_cast<const byte *>(f.pixels), mode.profile.width, mode.profile.height);
+                        unpacker.unpack(dest.data(), reinterpret_cast<const byte *>(f.pixels), mode.profile.width, mode.profile.height, f.frame_size);
                     }
 
                     // If any frame callbacks were specified, dispatch them now
@@ -594,6 +595,10 @@ namespace librealsense
             _is_opened = false;
             throw;
         }
+        if (Is<librealsense::global_time_interface>(_owner))
+        {
+            As<librealsense::global_time_interface>(_owner)->enable_time_diff_keeper(true);
+        }
         set_active_streams(requests);
     }
 
@@ -607,9 +612,17 @@ namespace librealsense
 
         for (auto& profile : _internal_config)
         {
-            _device->close(profile);
+            try // Handle disconnect event
+            {
+                _device->close(profile);
+            }
+            catch (...) {}
         }
         reset_streaming();
+        if (Is<librealsense::global_time_interface>(_owner))
+        {
+            As<librealsense::global_time_interface>(_owner)->enable_time_diff_keeper(false);
+        }
         _power.reset();
         _is_opened = false;
         set_active_streams({});
@@ -736,9 +749,9 @@ namespace librealsense
 
     void uvc_sensor::try_register_pu(rs2_option id)
     {
+        auto opt = std::make_shared<uvc_pu_option>(*this, id);
         try
         {
-            auto opt = std::make_shared<uvc_pu_option>(*this, id);
             auto range = opt->get_range();
             if (range.max <= range.min || range.step <= 0 || range.def < range.min || range.def > range.max) return;
 
@@ -750,7 +763,7 @@ namespace librealsense
         }
         catch (...)
         {
-            LOG_WARNING("Exception was thrown when inspecting properties of a sensor");
+            LOG_WARNING("Exception was thrown when inspecting " << this->get_info(RS2_CAMERA_INFO_NAME) << " property " << opt->get_description());
         }
     }
 
@@ -775,6 +788,9 @@ namespace librealsense
       _hid_iio_timestamp_reader(move(hid_iio_timestamp_reader)),
       _custom_hid_timestamp_reader(move(custom_hid_timestamp_reader))
     {
+        register_metadata(RS2_FRAME_METADATA_BACKEND_TIMESTAMP, make_additional_data_parser(&frame_additional_data::backend_timestamp));
+
+
         std::map<std::string, uint32_t> frequency_per_sensor;
         for (auto& elem : sensor_name_and_hid_profiles)
             frequency_per_sensor.insert(make_pair(elem.first, elem.second.fps));
@@ -783,12 +799,9 @@ namespace librealsense
         for (auto& elem : frequency_per_sensor)
             profiles_vector.push_back(platform::hid_profile{elem.first, elem.second});
 
-
-        _hid_device->open(profiles_vector);
+        _hid_device->register_profiles(profiles_vector);
         for (auto& elem : _hid_device->get_sensors())
             _hid_sensors.push_back(elem);
-
-        _hid_device->close();
     }
 
     hid_sensor::~hid_sensor()
@@ -869,6 +882,10 @@ namespace librealsense
             configured_hid_profiles.push_back(platform::hid_profile{elem.first, elem.second.fps});
         }
         _hid_device->open(configured_hid_profiles);
+        if (Is<librealsense::global_time_interface>(_owner))
+        {
+            As<librealsense::global_time_interface>(_owner)->enable_time_diff_keeper(true);
+        }
         _is_opened = true;
         set_active_streams(requests);
     }
@@ -887,6 +904,10 @@ namespace librealsense
         _is_configured_stream.resize(RS2_STREAM_COUNT);
         _hid_mapping.clear();
         _is_opened = false;
+        if (Is<librealsense::global_time_interface>(_owner))
+        {
+            As<librealsense::global_time_interface>(_owner)->enable_time_diff_keeper(false);
+        }
         set_active_streams({});
     }
 
@@ -963,12 +984,19 @@ namespace librealsense
             auto frame_counter = timestamp_reader->get_frame_counter(mode, sensor_data.fo);
             auto ts_domain = timestamp_reader->get_frame_timestamp_domain(mode, sensor_data.fo);
 
-            frame_additional_data additional_data{};
+            frame_additional_data additional_data(timestamp,
+                frame_counter,
+                system_time,
+                static_cast<uint8_t>(sensor_data.fo.metadata_size),
+                (const uint8_t*)sensor_data.fo.metadata,
+                sensor_data.fo.backend_time,
+                last_timestamp,
+                last_frame_number,
+                false);
 
-            additional_data.timestamp = timestamp;
-            additional_data.frame_number = frame_counter;
             additional_data.timestamp_domain = ts_domain;
-            additional_data.system_time = system_time;
+            additional_data.backend_timestamp = sensor_data.fo.backend_time;
+
             LOG_DEBUG("FrameAccepted," << get_string(request->get_stream_type())
                     << ",Counter," << std::dec << frame_counter << ",Index,0"
                     << ",BackEndTS," << std::fixed << sensor_data.fo.backend_time
@@ -988,7 +1016,7 @@ namespace librealsense
             frame->set_stream(request);
 
             std::vector<byte*> dest{const_cast<byte*>(frame->get_frame_data())};
-            mode.unpacker->unpack(dest.data(),(const byte*)sensor_data.fo.pixels, mode.profile.width, mode.profile.height);
+            mode.unpacker->unpack(dest.data(),(const byte*)sensor_data.fo.pixels, mode.profile.width, mode.profile.height, data_size);
 
             if (_on_before_frame_callback)
             {
@@ -1082,5 +1110,78 @@ namespace librealsense
           _timestamp_reader(std::move(timestamp_reader))
     {
         register_metadata(RS2_FRAME_METADATA_BACKEND_TIMESTAMP,     make_additional_data_parser(&frame_additional_data::backend_timestamp));
+    }
+
+    iio_hid_timestamp_reader::iio_hid_timestamp_reader()
+    {
+        counter.resize(sensors);
+        reset();
+    }
+
+    void iio_hid_timestamp_reader::reset()
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mtx);
+        started = false;
+        for (auto i = 0; i < sensors; ++i)
+        {
+            counter[i] = 0;
+        }
+    }
+
+    rs2_time_t iio_hid_timestamp_reader::get_frame_timestamp(const request_mapping& mode, const platform::frame_object& fo)
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mtx);
+
+        if (has_metadata(mode, fo.metadata, fo.metadata_size))
+        {
+            //  The timestamps conversions path comprise of:
+            // FW TS (32bit) ->    USB Phy Layer (no changes)  -> Host Driver TS (Extend to 64bit) ->  LRS read as 64 bit
+            // The flow introduces discrepancy with UVC stream which timestamps aer not extended to 64 bit by host driver both for Win and v4l backends.
+            // In order to allow for hw timestamp-based synchronization of Depth and IMU streams the latter will be trimmed to 32 bit.
+            // To revert to the extended 64 bit TS uncomment the next line instead
+            //auto timestamp = *((uint64_t*)((const uint8_t*)fo.metadata));
+            auto timestamp = (fo.metadata_size >= platform::hid_header_size) ?
+                static_cast<uint32_t>(((platform::hid_header*)(fo.metadata))->timestamp) : *((uint32_t*)((const uint8_t*)fo.metadata));
+
+            // HID timestamps are aligned to FW Default - usec units
+            return static_cast<rs2_time_t>(timestamp * TIMESTAMP_USEC_TO_MSEC);
+        }
+
+        if (!started)
+        {
+            LOG_WARNING("HID timestamp not found, switching to Host timestamps.");
+            started = true;
+        }
+
+        return std::chrono::duration<rs2_time_t, std::milli>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    bool iio_hid_timestamp_reader::has_metadata(const request_mapping& mode, const void * metadata, size_t metadata_size) const
+    {
+        if (metadata != nullptr && metadata_size > 0)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    unsigned long long iio_hid_timestamp_reader::get_frame_counter(const request_mapping & mode, const platform::frame_object& fo) const
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mtx);
+        if (nullptr == mode.pf) return 0;                   // Windows support is limited
+        int index = 0;
+        if (mode.pf->fourcc == rs_fourcc('G','Y','R','O'))
+            index = 1;
+
+        return ++counter[index];
+    }
+
+    rs2_timestamp_domain iio_hid_timestamp_reader::get_frame_timestamp_domain(const request_mapping & mode, const platform::frame_object& fo) const
+    {
+        if (has_metadata(mode, fo.metadata, fo.metadata_size))
+        {
+            return RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK;
+        }
+        return RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME;
     }
 }

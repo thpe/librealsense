@@ -48,7 +48,7 @@ public:
 
     void blocking_enqueue(T&& item)
     {
-        auto pred = [this]()->bool { return _queue.size() <= _cap; };
+        auto pred = [this]()->bool { return _queue.size() < _cap || _need_to_flush; };
 
         std::unique_lock<std::mutex> lock(_mutex);
         if (_accepting)
@@ -61,7 +61,7 @@ public:
     }
 
 
-    bool dequeue(T* item ,unsigned int timeout_ms = 5000)
+    bool dequeue(T* item ,unsigned int timeout_ms)
     {
         std::unique_lock<std::mutex> lock(_mutex);
         _accepting = true;
@@ -116,6 +116,7 @@ public:
         _accepting = false;
         _need_to_flush = true;
 
+        _enq_cv.notify_all();
         while (_queue.size() > 0)
         {
             auto item = std::move(_queue.front());
@@ -154,7 +155,7 @@ public:
             _queue.enqueue(std::move(item));
     }
 
-    bool dequeue(T* item, unsigned int timeout_ms = 5000)
+    bool dequeue(T* item, unsigned int timeout_ms)
     {
         return _queue.dequeue(item, timeout_ms);
     }
@@ -177,11 +178,6 @@ public:
     void start()
     {
         _queue.start();
-    }
-
-    void flush()
-    {
-        _queue.flush();
     }
 
     size_t size()
@@ -221,11 +217,12 @@ public:
     {
         _thread = std::thread([&]()
         {
+            int timeout_ms = 5000;
             while (_is_alive)
             {
                 std::function<void(cancellable_timer)> item;
 
-                if (_queue.dequeue(&item))
+                if (_queue.dequeue(&item, timeout_ms))
                 {
                     cancellable_timer time(this);
 

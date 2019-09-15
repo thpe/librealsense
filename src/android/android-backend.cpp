@@ -5,14 +5,18 @@
 
 #include "android-backend.h"
 #include "android-uvc.h"
-#include "android-hid.h"
 #include "../types.h"
-#include "usb_host/device_watcher.h"
+#include "device_watcher.h"
+#include "../usb/usb-enumerator.h"
 #include <chrono>
 #include <cctype> // std::tolower
+#include "hid/hid-types.h"
+#include "hid/hid-device.h"
 
-namespace librealsense {
-    namespace platform {
+namespace librealsense
+{
+    namespace platform
+    {
         android_backend::android_backend() {
         }
 
@@ -38,28 +42,26 @@ namespace librealsense {
         }
 
         std::vector<uvc_device_info> android_backend::query_uvc_devices() const {
-            return usb_host::device_watcher::query_uvc_devices();
+            return device_watcher_usbhost::instance()->query_uvc_devices();
         }
 
-        std::shared_ptr<usb_device> android_backend::create_usb_device(usb_device_info info) const {
-            throw std::runtime_error("create_usb_device Not supported");
+        std::shared_ptr<command_transfer> android_backend::create_usb_device(usb_device_info info) const {
+            auto dev = usb_enumerator::create_usb_device(info);
+            if(dev != nullptr)
+                return std::make_shared<platform::command_transfer_usb>(dev);
+            return nullptr;
         }
 
         std::vector<usb_device_info> android_backend::query_usb_devices() const {
-
-            std::vector<usb_device_info> result;
-            // Not supported
-            return result;
+            return usb_enumerator::query_devices_info();
         }
 
         std::shared_ptr<hid_device> android_backend::create_hid_device(hid_device_info info) const {
-            throw std::runtime_error("create_hid_device Not supported");
+            return create_rshid_device(info);
         }
 
         std::vector<hid_device_info> android_backend::query_hid_devices() const {
-            std::vector<hid_device_info> devices;
-            // Not supported 
-            return devices;
+            return query_hid_devices_info();
         }
 
         std::shared_ptr<time_service> android_backend::create_time_service() const {
@@ -68,7 +70,7 @@ namespace librealsense {
 
 
         std::shared_ptr<device_watcher> android_backend::create_device_watcher() const {
-            return std::make_shared<usb_host::device_watcher>();
+            return device_watcher_usbhost::instance();
         }
     }
 }

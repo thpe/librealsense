@@ -1,6 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
-#ifdef RS2_USE_WINUSB_UVC_BACKEND
 
 #if (_MSC_FULL_VER < 180031101)
     #error At least Visual Studio 2013 Update 4 is required to compile this backend
@@ -11,6 +10,7 @@
 #include "win7-usb.h"
 #include "win7-hid.h"
 #include "../types.h"
+#include "usb/usb-enumerator.h"
 #include <mfapi.h>
 #include <ks.h>
 #include <chrono>
@@ -66,34 +66,14 @@ namespace librealsense
             return devices;
         }
 
-        std::shared_ptr<usb_device> win7_backend::create_usb_device(usb_device_info info) const
+        std::shared_ptr<command_transfer> win7_backend::create_usb_device(usb_device_info info) const
         {
             return std::make_shared<winusb_bulk_transfer>(info);
         }
 
         std::vector<usb_device_info> win7_backend::query_usb_devices() const
         {
-            const std::vector<std::string> usb_interfaces = {
-                "{175695CD-30D9-4F87-8BE3-5A8270F49A31}",
-                "{08090549-CE78-41DC-A0FB-1BD66694BB0C}"
-            };
-
-            std::vector<usb_device_info> result;
-            for (auto&& interface_id : usb_interfaces)
-            {
-                for (auto&& id : usb_enumerate::query_by_interface(interface_id, "", ""))
-                {
-                    std::string path(id.begin(), id.end());
-                    uint16_t vid, pid, mi; std::string unique_id, device_guid;
-                    if (!parse_usb_path(vid, pid, mi, unique_id, device_guid, path)) continue;
-
-                    usb_device_info info{ path, vid, pid, mi, unique_id, "", usb_undefined };
-
-                    result.push_back(info);
-                }
-            }
-
-            return result;
+            return usb_enumerator::query_devices_info();
         }
 
         std::shared_ptr<hid_device> win7_backend::create_hid_device(hid_device_info info) const
@@ -289,7 +269,6 @@ namespace librealsense
                     DEVICE_NOTIFY_WINDOW_HANDLE);
                 if (data->hdevnotifyUVC == nullptr)
                 {
-                    UnregisterDeviceNotification(data->hdevnotifyHW);
                     LOG_WARNING("Register UVC events Failed!\n");
                     return FALSE;
                 }
@@ -305,7 +284,6 @@ namespace librealsense
                     DEVICE_NOTIFY_WINDOW_HANDLE);
                 if (data->hdevnotify_sensor == nullptr)
                 {
-                    UnregisterDeviceNotification(data->hdevnotify_sensor);
                     LOG_WARNING("Register UVC events Failed!\n");
                     return FALSE;
                 }
@@ -319,5 +297,3 @@ namespace librealsense
         }
     }
 }
-
-#endif

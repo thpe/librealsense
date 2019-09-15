@@ -5,6 +5,8 @@
 #include "../include/librealsense2/h/rs_types.h"     // Inherit all type definitions in the public API
 #include "backend.h"
 #include "types.h"
+#include "usb/usb-enumerator.h"
+#include "usb/usb-device.h"
 
 #include <cassert>
 #include <cstdlib>
@@ -31,11 +33,12 @@
 #include <regex>
 #include <list>
 #include <unordered_map>
-
+#include "hid/hid-device.h"
 #include <signal.h>
 
 #include "libuvc.h"
 #include "libuvc_internal.h"
+#include "usb/usb-enumerator.h"
 
 #pragma GCC diagnostic ignored "-Woverflow"
 
@@ -81,113 +84,6 @@ namespace librealsense
             return std::make_tuple(usb_bus + "-" + port_path.str() + "-" + usb_dev,dev_desc.bcdUSB);
         }
 
-        class uvclib_usb_device : public usb_device
-        {
-        public:
-            uvclib_usb_device(const usb_device_info& info)
-            {
-                int status = libusb_init(&_usb_context);
-                if(status < 0)
-                    throw linux_backend_exception(to_string() << "libusb_init(...) returned " << libusb_error_name(status));
-
-
-                std::vector<usb_device_info> results;
-                uvclib_usb_device::foreach_usb_device(_usb_context,
-                                                   [&results, info, this](const usb_device_info& i, libusb_device* dev)
-                                                   {
-                                                       if (i.unique_id == info.unique_id)
-                                                       {
-                                                           _usb_device = dev;
-                                                           libusb_ref_device(dev);
-                                                       }
-                                                   });
-
-                _mi = info.mi;
-            }
-
-            ~uvclib_usb_device()
-            {
-                if(_usb_device) libusb_unref_device(_usb_device);
-                libusb_exit(_usb_context);
-            }
-
-            static void foreach_usb_device(libusb_context* usb_context, std::function<void(
-                    const usb_device_info&,
-                    libusb_device*)> action)
-            {
-                // Obtain libusb_device_handle for each device
-                libusb_device ** list = nullptr;
-                auto devices = libusb_get_device_list(usb_context, &list);
-
-                if(devices < 0)
-                    throw linux_backend_exception(to_string() << "libusb_get_device_list(...) returned " << libusb_error_name(devices));
-
-                for(int i=0; i < devices; ++i)
-                {
-                    libusb_device * usb_device = list[i];
-                    libusb_config_descriptor *config;
-                    auto status = libusb_get_active_config_descriptor(usb_device, &config);
-                    if(status == 0)
-                    {
-                        auto parent_device = libusb_get_parent(usb_device);
-                        //if (parent_device)
-                        {
-                            usb_device_info info{};
-                            std::stringstream ss;
-                            auto usb_params = get_usb_descriptors(usb_device);
-                            info.unique_id = std::get<0>(usb_params);
-                            info.conn_spec = static_cast<usb_spec>(std::get<1>(usb_params));
-                            info.mi = config->bNumInterfaces - 1; // The hardware monitor USB interface is expected to be the last one
-                            action(info, usb_device);
-                        }
-
-                        libusb_free_config_descriptor(config);
-                    }
-                }
-                libusb_free_device_list(list, 1);
-            }
-
-            std::vector<uint8_t> send_receive(
-                    const std::vector<uint8_t>& data,
-                    int timeout_ms = 5000,
-                    bool require_response = true) override
-            {
-                libusb_device_handle* usb_handle = nullptr;
-                int status = libusb_open(_usb_device, &usb_handle);
-                if(status < 0)
-                    throw linux_backend_exception(to_string() << "libusb_open(...) returned " << libusb_error_name(status));
-                status = libusb_claim_interface(usb_handle, _mi);
-                if(status < 0)
-                    throw linux_backend_exception(to_string() << "libusb_claim_interface(...) returned " << libusb_error_name(status));
-
-                int actual_length;
-                status = libusb_bulk_transfer(usb_handle, 1, const_cast<uint8_t*>(data.data()), data.size(), &actual_length, timeout_ms);
-                if(status < 0)
-                    throw linux_backend_exception(to_string() << "libusb_bulk_transfer(...) returned " << libusb_error_name(status));
-
-                std::vector<uint8_t> result;
-
-
-                if (require_response)
-                {
-                    result.resize(1024);
-                    status = libusb_bulk_transfer(usb_handle, 0x81, const_cast<uint8_t*>(result.data()), result.size(), &actual_length, timeout_ms);
-                    if(status < 0)
-                        throw linux_backend_exception(to_string() << "libusb_bulk_transfer(...) returned " << libusb_error_name(status));
-
-                    result.resize(actual_length);
-                }
-
-                libusb_close(usb_handle);
-
-                return result;
-            }
-
-        private:
-            libusb_context* _usb_context;
-            libusb_device* _usb_device;
-            int _mi;
-        };
 
         class libuvc_uvc_device;
 
@@ -368,7 +264,6 @@ namespace librealsense
                 _stream_ctrls.clear();
                 _profiles.clear();
                 _callbacks.clear();
-                
             }
 
             void power_D0() {
@@ -389,6 +284,7 @@ namespace librealsense
                 if (res < 0) {
                     uvc_unref_device(_device);
                     _device = NULL;
+                    _device_handle = NULL;
                     throw linux_backend_exception("Could not open device.");
                 }
 
@@ -552,6 +448,8 @@ namespace librealsense
             int32_t get_data_usb( uvc_req_code action, int control, int unit) const {
                 unsigned char buffer[4];
 
+                if (!_device_handle) throw linux_backend_exception("Device not opened!");
+
                 int status = libusb_control_transfer(_device_handle->usb_devh,
                                                      UVC_REQ_TYPE_GET,
                                                      action,
@@ -596,7 +494,6 @@ namespace librealsense
             {
                 // Value may be translated according to action/option value
                 int32_t translated_value = value;
-                
                 switch (action)
                 {
                     case UVC_GET_CUR: // Translating from UVC 1.5 Spec up to RS
@@ -615,7 +512,6 @@ namespace librealsense
                             }
                         }
                         break;
-                        
                     case UVC_SET_CUR: // Translating from RS down to UVC 1.5 Spec
                         if (option == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                         {
@@ -634,42 +530,36 @@ namespace librealsense
                             }
                         }
                         break;
-                        
                     case UVC_GET_MIN:
                         if (option == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                         {
                             translated_value = 0; // Hardcoded MIN value
                         }
                         break;
-                        
                     case UVC_GET_MAX:
                         if (option == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                         {
                             translated_value = 1; // Hardcoded MAX value
                         }
                         break;
-                        
                     case UVC_GET_RES:
                         if (option == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                         {
                             translated_value = 1; // Hardcoded RES (step) value
                         }
                         break;
-                        
                     case UVC_GET_DEF:
                         if (option == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                         {
                             translated_value = 1; // Hardcoded DEF value
                         }
                         break;
-                        
                     default:
                         throw std::runtime_error("Unsupported action translation");
                 }
                 return translated_value;
             }
 
-            
             bool get_pu(rs2_option opt, int32_t& value) const override
             {
                 int unit;
@@ -694,16 +584,12 @@ namespace librealsense
             {
                 int unit;
                 int control = rs2_option_to_ctrl_selector(option, unit);
-                
                 int min = get_data_usb( UVC_GET_MIN, control, unit);
                 min = rs2_value_translate(UVC_GET_MIN, option, value);
-                
                 int max = get_data_usb( UVC_GET_MAX, control, unit);
                 max = rs2_value_translate(UVC_GET_MAX, option, value);
-                
                 int step = get_data_usb( UVC_GET_RES, control, unit);
                 step = rs2_value_translate(UVC_GET_RES, option, value);
-                
                 int def = get_data_usb( UVC_GET_DEF, control, unit);
                 def = rs2_value_translate(UVC_GET_DEF, option, value);
 
@@ -836,7 +722,6 @@ namespace librealsense
 
             device->uvc_callback(frame, context->_callback, context->_profile);
         }
-      
       /* implements backend. provide a libuvc backend. */
         class libuvc_backend : public backend
         {
@@ -871,45 +756,35 @@ namespace librealsense
                 return results;
             }
 
-            std::shared_ptr<usb_device> create_usb_device(usb_device_info info) const override
+            std::shared_ptr<command_transfer> create_usb_device(usb_device_info info) const override
             {
-                return std::make_shared<uvclib_usb_device>(info);
+                auto dev = usb_enumerator::create_usb_device(info);
+                if(dev != nullptr)
+                    return std::make_shared<platform::command_transfer_usb>(dev);
+                return nullptr;
             }
-            /* query USB devices on the system */
+
             std::vector<usb_device_info> query_usb_devices() const override
             {
-                libusb_context * usb_context = nullptr;
-                int status = libusb_init(&usb_context);
-                if(status < 0)
-                    throw linux_backend_exception(to_string() << "libusb_init(...) returned " << libusb_error_name(status));
-
-                std::vector<usb_device_info> results;
-                uvclib_usb_device::foreach_usb_device(usb_context,
-                                                   [&results](const usb_device_info& i, libusb_device* dev)
-                                                   {
-                                                       results.push_back(i);
-                                                   });
-                libusb_exit(usb_context);
-
-                return results;
+                return usb_enumerator::query_devices_info();
             }
 
             std::shared_ptr<hid_device> create_hid_device(hid_device_info info) const override
             {
-                return nullptr;
+                return create_rshid_device(info);
             }
 
             std::vector<hid_device_info> query_hid_devices() const override
             {
-                std::vector<hid_device_info> devices;
-                return devices;
+                return query_hid_devices_info();
             }
+
             std::shared_ptr<time_service> create_time_service() const override
             {
                 return std::make_shared<os_time_service>();
             }
 
-            std::shared_ptr<device_watcher> create_device_watcher() const
+            std::shared_ptr<device_watcher> create_device_watcher() const override
             {
                 return std::make_shared<polling_device_watcher>(this);
             }

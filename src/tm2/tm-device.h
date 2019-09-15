@@ -23,7 +23,7 @@ namespace librealsense
             perc::TrackingDevice* dev,
             std::shared_ptr<context> ctx,
             const platform::backend_device_group& group);
-        ~tm2_device();
+        virtual ~tm2_device();
 
         void enable_loopback(const std::string& source_file) override;
         void disable_loopback() override;
@@ -36,6 +36,9 @@ namespace librealsense
         };
         bool compress_while_record() const override { return false; }
 
+    protected:
+        void register_stream_to_extrinsic_group(const stream_interface& stream, uint32_t group_index);
+
     private:
         static const char* tm2_device_name()
         {
@@ -44,14 +47,15 @@ namespace librealsense
         std::shared_ptr<perc::TrackingManager> _manager;
         perc::TrackingDevice* _dev;
         std::shared_ptr<tm2_sensor> _sensor;
+
     };
 
     class tm2_sensor : public sensor_base, public video_sensor_interface, public wheel_odometry_interface,
-                       public pose_sensor_interface, public perc::TrackingDevice::Listener
+                       public pose_sensor_interface, public tm2_sensor_interface, public perc::TrackingDevice::Listener
     {
     public:
         tm2_sensor(tm2_device* owner, perc::TrackingDevice* dev);
-        ~tm2_sensor();
+        virtual ~tm2_sensor();
 
         // sensor interface
         ////////////////////
@@ -62,6 +66,7 @@ namespace librealsense
         void stop() override;
         rs2_intrinsics get_intrinsics(const stream_profile& profile) const override;
         rs2_motion_device_intrinsic get_motion_intrinsics(const motion_stream_profile_interface& profile) const;
+        rs2_extrinsics get_extrinsics(const stream_profile_interface & profile, perc::SensorId & reference_sensor_id) const;
 
         // Tracking listener
         ////////////////////
@@ -83,16 +88,62 @@ namespace librealsense
         void detach_controller(int id);
         void dispose();
         perc::TrackingData::Temperature get_temperature();
+        void set_exposure(float value);
+        float get_exposure() const;
+        void set_gain(float value);
+        float get_gain() const;
+        bool is_manual_exposure() const { return manual_exposure; }
+        void set_manual_exposure(bool manual);
 
         // Pose interfaces
-        bool export_relocalization_map(std::vector<uint8_t>& lmap_buf) const;
-        bool import_relocalization_map(const std::vector<uint8_t>& lmap_buf) const;
-        bool set_static_node(const std::string& guid, const float3& pos, const float4& orient_quat) const;
-        bool get_static_node(const std::string& guid, float3& pos, float4& orient_quat) const;
+
+        /**
+         * Get relocalization map that is currently on device, created and updated during most recent tracking session.
+         * Can be called before or after stop().
+         * \param[out] lmap_buf map data as a binary blob
+         * \return true if success
+         */
+        bool export_relocalization_map(std::vector<uint8_t>& lmap_buf) const override;
+
+        /**
+         * Load relocalization map onto device. Only one relocalization map can be imported at a time;
+         * any previously existing map will be overwritten.
+         * The imported map exists simultaneously with the map created during the most tracking session after start(),
+         * and they are merged after the imported map is relocalized.
+         * This operation must be done before start().
+         * \param[in] lmap_buf map data as a binary blob
+         * \return true if success
+         */
+        bool import_relocalization_map(const std::vector<uint8_t>& lmap_buf) const override;
+
+        /**
+         * Creates a named virtual landmark in the current map, known as static node.
+         * The static node's pose is provided relative to the origin of current coordinate system of device poses.
+         * This function fails if the current tracker confidence is below 3 (high confidence).
+         * \param[in] guid unique name of the static node. If a static node with the same name already exists
+         * in the current map or the imported map, the static node is overwritten.
+         * \param[in] pos position of the static node in the 3D space.
+         * \param[in] orient_quat orientation of the static node in the 3D space, represented by a unit quaternion.
+         * \return true if success.
+         */
+        bool set_static_node(const std::string& guid, const float3& pos, const float4& orient_quat) const override;
+
+        /**
+         * Gets the current pose of a static node that was created in the current map or in an imported map.
+         * Static nodes of imported maps are available after relocalizing the imported map.
+         * The static node's pose is returned relative to the current origin of coordinates of device poses.
+         * Thus, poses of static nodes of an imported map are consistent with current device poses after relocalization.
+         * This function fails if the current tracker confidence is below 3 (high confidence).
+         * \param[in] guid unique name of the static node.
+         * \param[out] pos position of the static node in the 3D space.
+         * \param[out] orient_quat orientation of the static node in the 3D space, represented by a unit quaternion.
+         * \return true if success.
+         */
+        bool get_static_node(const std::string& guid, float3& pos, float4& orient_quat) const override;
 
         // Wheel odometer
-        bool load_wheel_odometery_config(const std::vector<uint8_t>& odometry_config_buf) const ;
-        bool send_wheel_odometry(uint8_t wo_sensor_id, uint32_t frame_num, const float3& angular_velocity) const;
+        bool load_wheel_odometery_config(const std::vector<uint8_t>& odometry_config_buf) const override;
+        bool send_wheel_odometry(uint8_t wo_sensor_id, uint32_t frame_num, const float3& translational_velocity) const override;
 
         enum async_op_state {
             _async_init     = 1 << 0,
@@ -106,10 +157,19 @@ namespace librealsense
         async_op_state perform_async_transfer(std::function<perc::Status()> transfer_activator,
             std::function<void()> on_success, const std::string& op_description) const;
         // Recording interfaces
-        virtual void create_snapshot(std::shared_ptr<pose_sensor_interface>& snapshot) const {}
+        virtual void create_snapshot(std::shared_ptr<pose_sensor_interface>& snapshot) const override {}
         virtual void enable_recording(std::function<void(const pose_sensor_interface&)> record_action) override {}
-        virtual void create_snapshot(std::shared_ptr<wheel_odometry_interface>& snapshot) const {}
+        virtual void create_snapshot(std::shared_ptr<wheel_odometry_interface>& snapshot) const override {}
         virtual void enable_recording(std::function<void(const wheel_odometry_interface&)> record_action) override {}
+
+        //calibration write interface
+        static const uint16_t ID_OEM_CAL = 6;
+        void set_intrinsics(const stream_profile_interface& stream_profile, const rs2_intrinsics& intr) override;
+        void set_extrinsics(const stream_profile_interface& from_profile, const stream_profile_interface& to_profile, const rs2_extrinsics& extr) override;
+        void set_motion_device_intrinsics(const stream_profile_interface& stream_profile, const rs2_motion_device_intrinsic& intr) override;
+        void reset_to_factory_calibration() override;
+        void write_calibration() override;
+        void set_extrinsics_to_ref(rs2_stream stream_type, int stream_index, const rs2_extrinsics& extr);
 
     private:
         void handle_imu_frame(perc::TrackingData::TimestampedData& tm_frame_ts, unsigned long long frame_number, rs2_stream stream_type, int index, float3 imu_data, float temperature);
@@ -123,8 +183,15 @@ namespace librealsense
         std::shared_ptr<playback_device>_loopback;
         perc::TrackingData::Profile     _tm_supported_profiles;
         perc::TrackingData::Profile     _tm_active_profiles;
+        perc::SIXDOF_MODE               _tm_mode = perc::SIXDOF_MODE_ENABLE_MAPPING | perc::SIXDOF_MODE_ENABLE_RELOCALIZATION;
         mutable std::condition_variable _async_op;
         mutable async_op_state          _async_op_status;
         mutable std::vector<uint8_t>    _async_op_res_buffer;
+
+        float last_exposure = 200.f;
+        float last_gain = 1.f;
+        bool manual_exposure = false;
+
+        template <perc::SIXDOF_MODE flag, perc::SIXDOF_MODE depends_on, bool invert> friend class tracking_mode_option;
     };
 }

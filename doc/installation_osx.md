@@ -18,11 +18,13 @@
 4. Generate XCode project:
   * `mkdir build && cd build`
   * `sudo xcode-select --reset`
-  * `cmake .. -DBUILD_EXAMPLES=true -DBUILD_WITH_OPENMP=false -DHWM_OVER_XU=false -G Xcode`
+  * `cmake .. -DBUILD_EXAMPLES=true -DBUILD_WITH_OPENMP=false -DHWM_OVER_XU=false`
 5. Build the Project
   * `make -j`
 
 > **Note:** On some Mac systems you might encounter `ld: library not found for -lusb-1.0` error (either in the terminal during make or in XCode) This can be worked-around by setting environment variable: `/bin/launchctl setenv LIBRARY_PATH /usr/local/lib`
+
+  **Note:** You can find more information about the available configuration options on [this wiki page](https://github.com/IntelRealSense/librealsense/wiki/Build-Configuration).
 
 ## What works?
 * SR300, D415 and D435 will stream depth, infrared and color at all supported resolutions
